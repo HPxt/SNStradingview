@@ -46,12 +46,14 @@ RSI_WARNING_LIMIT = float(os.getenv("RSI_WARNING_LIMIT", os.getenv("RSI_LIMIT", 
 RSI_EXTREME_LIMIT = float(os.getenv("RSI_EXTREME_LIMIT", "30"))
 CHECK_INTERVAL_MIN = int(os.getenv("CHECK_INTERVAL_MIN", "15"))
 LEVERAGE = float(os.getenv("LEVERAGE", "10"))
-BACKTEST_MIN_TRADES = int(os.getenv("BACKTEST_MIN_TRADES", "5"))
+BACKTEST_MIN_TRADES = int(os.getenv("BACKTEST_MIN_TRADES", "12"))
 BACKTEST_MAX_SIGNALS = int(os.getenv("BACKTEST_MAX_SIGNALS", "80"))
+BACKTEST_VALIDATION_RATIO = float(os.getenv("BACKTEST_VALIDATION_RATIO", "0.35"))
+BACKTEST_SIGNAL_COOLDOWN = int(os.getenv("BACKTEST_SIGNAL_COOLDOWN", "0"))
 TRAINING_INTERVAL_MIN = int(os.getenv("TRAINING_INTERVAL_MIN", "180"))
 TRAINING_CANDLE_LIMIT = int(os.getenv("TRAINING_CANDLE_LIMIT", "1000"))
-PLAN_MIN_WIN_RATE = float(os.getenv("PLAN_MIN_WIN_RATE", "58"))
-PLAN_MIN_PROFIT_FACTOR = float(os.getenv("PLAN_MIN_PROFIT_FACTOR", "1.15"))
+PLAN_MIN_WIN_RATE = float(os.getenv("PLAN_MIN_WIN_RATE", "60"))
+PLAN_MIN_PROFIT_FACTOR = float(os.getenv("PLAN_MIN_PROFIT_FACTOR", "1.25"))
 PLAN_MIN_AVG_ROI = float(os.getenv("PLAN_MIN_AVG_ROI", "0"))
 
 BINANCE_BASE_URLS = [
@@ -254,6 +256,10 @@ def is_backtest_qualified(backtest_stats: dict | None) -> tuple[bool, str]:
     if backtest_stats["sample_size"] < BACKTEST_MIN_TRADES:
         return False, f"amostra insuficiente ({backtest_stats['sample_size']}/{BACKTEST_MIN_TRADES})"
 
+    train_stats = backtest_stats.get("train_stats")
+    if train_stats and train_stats["sample_size"] < BACKTEST_MIN_TRADES:
+        return False, f"treino insuficiente ({train_stats['sample_size']}/{BACKTEST_MIN_TRADES})"
+
     if backtest_stats["win_rate_pct"] < PLAN_MIN_WIN_RATE:
         return False, f"assertividade abaixo do minimo ({pct_fmt(backtest_stats['win_rate_pct'])})"
 
@@ -262,6 +268,9 @@ def is_backtest_qualified(backtest_stats: dict | None) -> tuple[bool, str]:
 
     if backtest_stats["avg_roi_pct"] < PLAN_MIN_AVG_ROI:
         return False, f"ROI medio abaixo do minimo ({pct_fmt(backtest_stats['avg_roi_pct'])})"
+
+    if backtest_stats.get("overfit_warning"):
+        return False, f"risco de overfitting alto (gap {pct_fmt(backtest_stats['overfit_gap_pct'])})"
 
     return True, "modelo aprovado pelo backtest"
 
@@ -431,32 +440,17 @@ def simulate_trade_outcome(df: pd.DataFrame, start_index: int, plan: dict, tf_la
     return {"outcome": "timeout", "roi_pct": roi_pct}
 
 
-def evaluate_backtest(df: pd.DataFrame, rsi_series: pd.Series, tf_label: str, level_key: str) -> dict:
-    """Backtest walk-forward simples dos sinais RSI com o plano atual."""
-    limit = RSI_EXTREME_LIMIT if level_key == "extreme" else RSI_WARNING_LIMIT
-    start = max(80, RSI_PERIOD + 50)
-    end = len(df) - BACKTEST_LOOKAHEAD.get(tf_label, 16) - 1
-
-    if end <= start:
-        return {"sample_size": 0, "win_rate_pct": 0.0, "avg_roi_pct": 0.0, "profit_factor": 0.0}
-
-    trades = []
-    signal_indexes = [
-        index
-        for index in range(start, end)
-        if pd.notna(rsi_series.iloc[index]) and float(rsi_series.iloc[index]) < limit
-    ][-BACKTEST_MAX_SIGNALS:]
-
-    for index in signal_indexes:
-        historical_df = df.iloc[: index + 1]
-        historical_rsi = float(rsi_series.iloc[index])
-        plan = build_trade_plan(historical_df, historical_rsi, tf_label, level_key)
-        outcome = simulate_trade_outcome(df, index, plan, tf_label)
-        if outcome["outcome"] != "open":
-            trades.append(outcome)
-
+def summarize_trades(trades: list[dict]) -> dict:
     if not trades:
-        return {"sample_size": 0, "win_rate_pct": 0.0, "avg_roi_pct": 0.0, "profit_factor": 0.0}
+        return {
+            "sample_size": 0,
+            "win_rate_pct": 0.0,
+            "avg_roi_pct": 0.0,
+            "profit_factor": 0.0,
+            "wins": 0,
+            "losses": 0,
+            "timeouts": 0,
+        }
 
     wins = [trade for trade in trades if trade["roi_pct"] > 0]
     losses = [trade for trade in trades if trade["roi_pct"] < 0]
@@ -473,6 +467,65 @@ def evaluate_backtest(df: pd.DataFrame, rsi_series: pd.Series, tf_label: str, le
         "losses": len(losses),
         "timeouts": len([trade for trade in trades if trade["outcome"] == "timeout"]),
     }
+
+
+def evaluate_backtest(df: pd.DataFrame, rsi_series: pd.Series, tf_label: str, level_key: str) -> dict:
+    """Backtest walk-forward com validacao fora da amostra."""
+    limit = RSI_EXTREME_LIMIT if level_key == "extreme" else RSI_WARNING_LIMIT
+    start = max(80, RSI_PERIOD + 50)
+    horizon = BACKTEST_LOOKAHEAD.get(tf_label, 16)
+    cooldown = BACKTEST_SIGNAL_COOLDOWN or horizon
+    end = len(df) - horizon - 1
+
+    if end <= start:
+        return summarize_trades([])
+
+    signal_indexes = []
+    last_signal_index = -cooldown
+    for index in range(start, end):
+        if index - last_signal_index < cooldown:
+            continue
+        if pd.notna(rsi_series.iloc[index]) and float(rsi_series.iloc[index]) < limit:
+            signal_indexes.append(index)
+            last_signal_index = index
+
+    signal_indexes = signal_indexes[-BACKTEST_MAX_SIGNALS:]
+
+    trades = []
+    for index in signal_indexes:
+        historical_df = df.iloc[: index + 1]
+        historical_rsi = float(rsi_series.iloc[index])
+        plan = build_trade_plan(historical_df, historical_rsi, tf_label, level_key)
+        outcome = simulate_trade_outcome(df, index, plan, tf_label)
+        if outcome["outcome"] != "open":
+            trades.append(outcome)
+
+    validation_size = max(BACKTEST_MIN_TRADES, round(len(trades) * BACKTEST_VALIDATION_RATIO))
+    validation_size = min(validation_size, len(trades))
+    train_trades = trades[: len(trades) - validation_size]
+    validation_trades = trades[len(trades) - validation_size :]
+
+    train_stats = summarize_trades(train_trades)
+    validation_stats = summarize_trades(validation_trades)
+    all_stats = summarize_trades(trades)
+    overfit_gap = round(train_stats["win_rate_pct"] - validation_stats["win_rate_pct"], 2)
+    overfit_warning = (
+        train_stats["sample_size"] >= BACKTEST_MIN_TRADES
+        and validation_stats["sample_size"] >= BACKTEST_MIN_TRADES
+        and overfit_gap > 20
+    )
+
+    validation_stats.update(
+        {
+            "train_stats": train_stats,
+            "all_stats": all_stats,
+            "validation_ratio": BACKTEST_VALIDATION_RATIO,
+            "cooldown_candles": cooldown,
+            "overfit_gap_pct": overfit_gap,
+            "overfit_warning": overfit_warning,
+        }
+    )
+    return validation_stats
 
 
 def train_one_strategy(symbol: str, tf_label: str, tf_interval: str) -> dict:
@@ -957,6 +1010,8 @@ def rsi_status():
                 "leverage": LEVERAGE,
                 "backtest_min_trades": BACKTEST_MIN_TRADES,
                 "backtest_max_signals": BACKTEST_MAX_SIGNALS,
+                "backtest_validation_ratio": BACKTEST_VALIDATION_RATIO,
+                "backtest_signal_cooldown": BACKTEST_SIGNAL_COOLDOWN,
                 "training_interval_min": TRAINING_INTERVAL_MIN,
                 "training_candle_limit": TRAINING_CANDLE_LIMIT,
                 "plan_min_win_rate": PLAN_MIN_WIN_RATE,

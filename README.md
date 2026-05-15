@@ -50,12 +50,14 @@ Opcionais:
 | `RSI_EXTREME_LIMIT` | `30` | Dispara alerta extremo separado quando RSI fica abaixo deste valor |
 | `CHECK_INTERVAL_MIN` | `15` | Intervalo entre verificacoes |
 | `LEVERAGE` | `10` | Alavancagem usada apenas para estimar TP/SL no alerta |
-| `BACKTEST_MIN_TRADES` | `5` | Amostra minima para calibrar confianca pelo backtest |
+| `BACKTEST_MIN_TRADES` | `12` | Amostra minima para calibrar confianca pelo backtest |
 | `BACKTEST_MAX_SIGNALS` | `80` | Maximo de sinais historicos avaliados por par/timeframe |
+| `BACKTEST_VALIDATION_RATIO` | `0.35` | Parte final dos sinais usada como validacao fora da amostra |
+| `BACKTEST_SIGNAL_COOLDOWN` | `0` | Cooldown entre sinais; `0` usa o horizonte do timeframe |
 | `TRAINING_INTERVAL_MIN` | `180` | Frequencia do treino/calibracao em background |
 | `TRAINING_CANDLE_LIMIT` | `1000` | Candles usados no treino historico por par/timeframe |
-| `PLAN_MIN_WIN_RATE` | `58` | Assertividade minima para mostrar entrada/TP/SL no e-mail |
-| `PLAN_MIN_PROFIT_FACTOR` | `1.15` | Profit factor minimo para mostrar plano no e-mail |
+| `PLAN_MIN_WIN_RATE` | `60` | Assertividade minima para mostrar entrada/TP/SL no e-mail |
+| `PLAN_MIN_PROFIT_FACTOR` | `1.25` | Profit factor minimo para mostrar plano no e-mail |
 | `PLAN_MIN_AVG_ROI` | `0` | ROI medio minimo simulado para mostrar plano no e-mail |
 | `BINANCE_BASE_URLS` | `https://data-api.binance.vision,https://api1.binance.com,https://api.binance.com` | URLs da Binance para tentar em ordem |
 | `DISABLE_SCHEDULER` | vazio | Use `true` para desativar o agendador |
