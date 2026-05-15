@@ -19,7 +19,7 @@ rsi_alertas/
 - Calcula RSI de 14 periodos usando suavizacao estilo Wilder.
 - Verifica os timeframes a cada 15 minutos.
 - Evita e-mail duplicado para o mesmo par/timeframe dentro da mesma hora.
-- Expoe `/` como health check e `/check` para rodar uma verificacao manual.
+- Expoe `/` como health check, `/check` para rodar uma verificacao manual e `/rsi` para diagnosticar os valores atuais.
 
 ## Variaveis de ambiente
 
@@ -59,6 +59,7 @@ Depois acesse:
 
 - `http://localhost:5000/`
 - `http://localhost:5000/check`
+- `http://localhost:5000/rsi`
 
 ## Deploy no Render
 

@@ -8,7 +8,7 @@ from email.mime.text import MIMEText
 import pandas as pd
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask
+from flask import Flask, jsonify
 
 app = Flask(__name__)
 
@@ -92,19 +92,85 @@ def get_candles(symbol: str, interval: str, limit: int = CANDLE_LIMIT) -> pd.Dat
 
 
 def calc_rsi(series: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
-    """Calcula RSI usando media exponencial suavizada, mais proximo do padrao Wilder."""
+    """Calcula RSI usando suavizacao Wilder/RMA, como no TradingView."""
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
-    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_gain = gain.rolling(period, min_periods=period).mean()
+    avg_loss = loss.rolling(period, min_periods=period).mean()
+
+    first_valid = avg_gain.first_valid_index()
+    if first_valid is not None:
+        start_pos = avg_gain.index.get_loc(first_valid) + 1
+        for i in range(start_pos, len(series)):
+            prev_index = avg_gain.index[i - 1]
+            current_index = avg_gain.index[i]
+            avg_gain.loc[current_index] = (
+                (avg_gain.loc[prev_index] * (period - 1)) + gain.loc[current_index]
+            ) / period
+            avg_loss.loc[current_index] = (
+                (avg_loss.loc[prev_index] * (period - 1)) + loss.loc[current_index]
+            ) / period
 
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
     rsi = rsi.mask(avg_loss == 0, 100)
     rsi = rsi.mask((avg_gain == 0) & (avg_loss == 0), 50)
     return rsi
+
+
+def scan_rsi_values() -> tuple[list[dict], list[dict]]:
+    """Calcula todos os RSI e retorna valores atuais e alertas pendentes."""
+    now_slot = utc_now().strftime("%Y-%m-%d %H")
+    values = []
+    alerts = []
+
+    for symbol in SYMBOLS:
+        for tf_label, tf_interval in TIMEFRAMES.items():
+            df = get_candles(symbol, tf_interval)
+            if df is None:
+                values.append(
+                    {
+                        "symbol": symbol,
+                        "tf": tf_label,
+                        "rsi": None,
+                        "alert": False,
+                        "error": "candles_unavailable",
+                    }
+                )
+                continue
+
+            rsi = calc_rsi(df["close"]).dropna()
+            if rsi.empty:
+                values.append(
+                    {
+                        "symbol": symbol,
+                        "tf": tf_label,
+                        "rsi": None,
+                        "alert": False,
+                        "error": "insufficient_data",
+                    }
+                )
+                continue
+
+            value = float(rsi.iloc[-1])
+            key = f"{symbol}_{tf_label}_{now_slot}"
+            is_alert = value < RSI_LIMIT
+            already_alerted = key in _alerted
+            item = {
+                "symbol": symbol,
+                "tf": tf_label,
+                "rsi": round(value, 2),
+                "alert": is_alert,
+                "already_alerted_this_hour": already_alerted,
+            }
+            values.append(item)
+
+            if is_alert and not already_alerted:
+                alerts.append({"symbol": symbol, "tf": tf_label, "rsi": value, "key": key})
+
+    return values, alerts
 
 
 def send_email(subject: str, body_html: str) -> bool:
@@ -183,30 +249,12 @@ def check_rsi() -> list[dict]:
 
     print(f"\n[{now.strftime('%d/%m %H:%M')}] Verificando RSI...")
 
-    for symbol in SYMBOLS:
-        for tf_label, tf_interval in TIMEFRAMES.items():
-            df = get_candles(symbol, tf_interval)
-            if df is None:
-                continue
-
-            rsi = calc_rsi(df["close"]).dropna()
-            if rsi.empty:
-                print(f"  {symbol} {tf_label}: dados insuficientes")
-                continue
-
-            value = float(rsi.iloc[-1])
-            print(f"  {symbol} {tf_label}: RSI = {value:.2f}")
-
-            key = f"{symbol}_{tf_label}_{now_slot}"
-            if value < RSI_LIMIT and key not in _alerted:
-                alerts.append(
-                    {
-                        "symbol": symbol,
-                        "tf": tf_label,
-                        "rsi": value,
-                    }
-                )
-                _alerted.add(key)
+    values, alerts = scan_rsi_values()
+    for item in values:
+        if item["rsi"] is None:
+            print(f"  {item['symbol']} {item['tf']}: {item['error']}")
+        else:
+            print(f"  {item['symbol']} {item['tf']}: RSI = {item['rsi']:.2f}")
 
     # Limpa alertas antigos e mantem apenas o slot atual.
     _alerted = {key for key in _alerted if now_slot in key}
@@ -214,7 +262,10 @@ def check_rsi() -> list[dict]:
     if alerts:
         pairs = ", ".join(sorted({alert["symbol"] for alert in alerts}))
         subject = f"RSI abaixo de {RSI_LIMIT:g} - {pairs}"
-        send_email(subject, build_email_html(alerts))
+        if send_email(subject, build_email_html(alerts)):
+            _alerted.update(alert["key"] for alert in alerts)
+        else:
+            print("[ALERTA] E-mail nao enviado; alerta sera tentado novamente na proxima checagem.")
     else:
         print("  Nenhum alerta disparado.")
 
@@ -263,6 +314,30 @@ def force_check():
     """Rota para disparar verificacao manual."""
     alerts = check_rsi()
     return f"Verificacao executada. Alertas encontrados: {len(alerts)}.", 200
+
+
+@app.route("/rsi")
+def rsi_status():
+    """Mostra os RSI que o app esta calculando agora."""
+    values, alerts = scan_rsi_values()
+    return jsonify(
+        {
+            "checked_at_utc": utc_now().isoformat(),
+            "config": {
+                "rsi_period": RSI_PERIOD,
+                "rsi_limit": RSI_LIMIT,
+                "check_interval_min": CHECK_INTERVAL_MIN,
+                "symbols": SYMBOLS,
+                "timeframes": list(TIMEFRAMES.keys()),
+            },
+            "email_configured": bool(EMAIL_FROM and EMAIL_TO and GMAIL_PASS),
+            "pending_alerts": [
+                {"symbol": alert["symbol"], "tf": alert["tf"], "rsi": round(alert["rsi"], 2)}
+                for alert in alerts
+            ],
+            "values": values,
+        }
+    )
 
 
 start_scheduler()
