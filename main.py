@@ -44,6 +44,8 @@ TIMEFRAMES = {
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 RSI_WARNING_LIMIT = float(os.getenv("RSI_WARNING_LIMIT", os.getenv("RSI_LIMIT", "40")))
 RSI_EXTREME_LIMIT = float(os.getenv("RSI_EXTREME_LIMIT", "30"))
+RSI_RECOVERY_LOOKBACK = int(os.getenv("RSI_RECOVERY_LOOKBACK", "6"))
+RSI_RECOVERY_BUFFER = float(os.getenv("RSI_RECOVERY_BUFFER", "2"))
 CHECK_INTERVAL_MIN = int(os.getenv("CHECK_INTERVAL_MIN", "15"))
 LEVERAGE = float(os.getenv("LEVERAGE", "10"))
 BACKTEST_MIN_TRADES = int(os.getenv("BACKTEST_MIN_TRADES", "12"))
@@ -60,6 +62,13 @@ PLAN_MIN_SCORE = int(os.getenv("PLAN_MIN_SCORE", "60"))
 CONTEXT_MIN_SCORE = int(os.getenv("CONTEXT_MIN_SCORE", "55"))
 CONTEXT_MIN_FILTERS = int(os.getenv("CONTEXT_MIN_FILTERS", "4"))
 TRADE_COST_ROI_PCT = float(os.getenv("TRADE_COST_ROI_PCT", "1.2"))
+SPLIT_ENTRY_ENABLED = os.getenv("SPLIT_ENTRY_ENABLED", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+SPLIT_ENTRY_FIRST_SIZE_PCT = float(os.getenv("SPLIT_ENTRY_FIRST_SIZE_PCT", "50"))
+SPLIT_ENTRY_SECOND_ROI_DROP = float(os.getenv("SPLIT_ENTRY_SECOND_ROI_DROP", "80"))
 OPTIMIZE_TRADE_PARAMS = os.getenv("OPTIMIZE_TRADE_PARAMS", "true").lower() in {
     "1",
     "true",
@@ -487,6 +496,41 @@ def is_backtest_qualified(backtest_stats: dict | None) -> tuple[bool, str]:
     return True, "modelo aprovado pelo backtest"
 
 
+def rsi_recovery_signal(rsi_series: pd.Series, level_key: str) -> tuple[bool, dict]:
+    clean = rsi_series.dropna()
+    if len(clean) < RSI_RECOVERY_LOOKBACK + 2:
+        return False, {"reason": "RSI insuficiente para confirmar recuperacao"}
+
+    limit = RSI_EXTREME_LIMIT if level_key == "extreme" else RSI_WARNING_LIMIT
+    recent = clean.iloc[-(RSI_RECOVERY_LOOKBACK + 1) :]
+    previous = float(clean.iloc[-2])
+    current = float(clean.iloc[-1])
+    recent_min = float(recent.min())
+    crossed_up = previous <= limit and current > limit
+    recovered_from_low = recent_min < limit and current >= recent_min + RSI_RECOVERY_BUFFER and current > previous
+    still_reasonable = current <= limit + 8
+    passed = (crossed_up or recovered_from_low) and still_reasonable
+
+    reason = "cruzou para cima" if crossed_up else "recuperando do fundo recente"
+    if not passed:
+        reason = (
+            f"sem recuperacao confirmada: atual {current:.2f}, "
+            f"anterior {previous:.2f}, minimo recente {recent_min:.2f}"
+        )
+
+    return passed, {
+        "level": level_key,
+        "limit": limit,
+        "current": round(current, 2),
+        "previous": round(previous, 2),
+        "recent_min": round(recent_min, 2),
+        "crossed_up": crossed_up,
+        "recovered_from_low": recovered_from_low,
+        "passed": passed,
+        "reason": reason,
+    }
+
+
 def is_plan_sendable(plan: dict | None) -> tuple[bool, str]:
     if not plan:
         return False, "sem plano tecnico"
@@ -521,6 +565,7 @@ def build_trade_plan(
     backtest_stats: dict | None = None,
     params: dict | None = None,
     context: dict | None = None,
+    recovery: dict | None = None,
 ) -> dict:
     """Gera um plano tecnico educacional, sem automatizar ordem."""
     close = float(df["close"].iloc[-1])
@@ -564,7 +609,19 @@ def build_trade_plan(
     else:
         confidence = "baixa"
 
-    entry_price = close
+    first_entry_price = close
+    first_entry_size_pct = min(max(SPLIT_ENTRY_FIRST_SIZE_PCT, 1), 99)
+    second_entry_size_pct = 100 - first_entry_size_pct
+    second_entry_price_pct = SPLIT_ENTRY_SECOND_ROI_DROP / LEVERAGE
+    second_entry_price = first_entry_price * (1 - second_entry_price_pct / 100)
+    entry_price = first_entry_price
+    average_entry_price = first_entry_price
+    if SPLIT_ENTRY_ENABLED:
+        average_entry_price = (
+            (first_entry_price * first_entry_size_pct)
+            + (second_entry_price * second_entry_size_pct)
+        ) / 100
+        entry_price = average_entry_price
     entry_pullback_pct = min(max(atr_pct * 0.25, 0.25), 1.2)
     entry_zone_low = entry_price * (1 - entry_pullback_pct / 100)
     entry_zone_high = entry_price * (1 + 0.15 / 100)
@@ -588,7 +645,13 @@ def build_trade_plan(
 
     tp1_price = entry_price * (1 + tp1_price_pct / 100)
     tp2_price = entry_price * (1 + tp2_price_pct / 100)
-    sl_price = entry_price * (1 - sl_price_pct / 100)
+    if SPLIT_ENTRY_ENABLED:
+        second_leg_sl_buffer_pct = max(sl_price_pct, atr_pct * 0.5, 0.5)
+        sl_price = second_entry_price * (1 - second_leg_sl_buffer_pct / 100)
+        sl_price_pct = ((entry_price - sl_price) / entry_price) * 100
+        sl_roi_pct = sl_price_pct * LEVERAGE
+    else:
+        sl_price = entry_price * (1 - sl_price_pct / 100)
 
     fib_note = "correcao profunda perto do fundo recente"
     if range_position > 0.618:
@@ -603,6 +666,17 @@ def build_trade_plan(
         f"Leitura tipo Elliott/Fibo: {fib_note}",
         f"ATR aprox.: {pct_fmt(atr_pct)}",
     ]
+    if SPLIT_ENTRY_ENABLED:
+        notes.append(
+            "Entrada dividida: "
+            f"{first_entry_size_pct:.0f}% agora em {price_fmt(first_entry_price)}; "
+            f"{second_entry_size_pct:.0f}% em -{pct_fmt(SPLIT_ENTRY_SECOND_ROI_DROP)} ROI "
+            f"(preco {price_fmt(second_entry_price)}); "
+            f"preco medio planejado {price_fmt(average_entry_price)}"
+        )
+        notes.append(
+            f"Stop ajustado abaixo da segunda entrada para nao invalidar o reforco antes dele acontecer"
+        )
 
     qualified, qualification_reason = is_backtest_qualified(backtest_stats)
 
@@ -652,6 +726,9 @@ def build_trade_plan(
         )
         notes.append("Filtros favoraveis: " + ", ".join(context["passed_filters"][:5]))
 
+    if recovery:
+        notes.append(f"Confirmacao RSI: {recovery['reason']}")
+
     return {
         "side": "long educativo",
         "leverage": LEVERAGE,
@@ -660,6 +737,13 @@ def build_trade_plan(
         "qualified": qualified,
         "qualification_reason": qualification_reason,
         "entry_price": entry_price,
+        "first_entry_price": first_entry_price,
+        "first_entry_size_pct": first_entry_size_pct,
+        "second_entry_price": second_entry_price if SPLIT_ENTRY_ENABLED else None,
+        "second_entry_size_pct": second_entry_size_pct if SPLIT_ENTRY_ENABLED else 0,
+        "second_entry_roi_drop_pct": SPLIT_ENTRY_SECOND_ROI_DROP if SPLIT_ENTRY_ENABLED else None,
+        "average_entry_price": average_entry_price,
+        "split_entry_enabled": SPLIT_ENTRY_ENABLED,
         "entry_zone_low": entry_zone_low,
         "entry_zone_high": entry_zone_high,
         "tp1_price": tp1_price,
@@ -676,11 +760,20 @@ def build_trade_plan(
         "notes": notes,
         "backtest": backtest_stats,
         "context": context,
+        "recovery": recovery,
         "summary": (
-            f"Entrada ref. {price_fmt(entry_price)} | "
+            f"Entrada ref. {price_fmt(first_entry_price)}"
+            + (
+                f" + reforco em {price_fmt(second_entry_price)} "
+                f"(medio {price_fmt(average_entry_price)}) | "
+                if SPLIT_ENTRY_ENABLED
+                else " | "
+            )
+            + (
             f"TP1 +{pct_fmt(tp1_price_pct)} (~{pct_fmt(tp1_roi_pct)} em {LEVERAGE:g}x) | "
             f"TP2 +{pct_fmt(tp2_price_pct)} (~{pct_fmt(tp2_roi_pct)} em {LEVERAGE:g}x) | "
             f"SL -{pct_fmt(sl_price_pct)} (~-{pct_fmt(sl_roi_pct)} em {LEVERAGE:g}x)"
+            )
         ),
     }
 
@@ -698,23 +791,41 @@ def simulate_trade_outcome(
     if future.empty:
         return {"outcome": "open", "roi_pct": 0.0}
 
-    tp1_price = plan["tp1_price"]
-    tp2_price = plan["tp2_price"]
-    sl_price = plan["sl_price"]
+    first_entry = plan.get("first_entry_price", plan["entry_price"])
+    first_weight = plan.get("first_entry_size_pct", 100) / 100
+    second_entry = plan.get("second_entry_price")
+    second_weight = plan.get("second_entry_size_pct", 0) / 100
+    split_pending = bool(plan.get("split_entry_enabled") and second_entry and second_weight > 0)
+
+    active_entry = first_entry
+    active_weight = first_weight if split_pending else 1.0
+    active_tp1 = active_entry * (1 + plan["tp1_price_pct"] / 100)
+    active_tp2 = active_entry * (1 + plan["tp2_price_pct"] / 100)
 
     for _, candle in future.iterrows():
-        if float(candle["low"]) <= sl_price:
-            roi = -plan["sl_roi_pct"]
+        candle_low = float(candle["low"])
+        candle_high = float(candle["high"])
+
+        if split_pending and candle_low <= second_entry:
+            split_pending = False
+            active_weight = 1.0
+            active_entry = plan["average_entry_price"]
+            active_tp1 = plan["tp1_price"]
+            active_tp2 = plan["tp2_price"]
+
+        active_sl = plan["sl_price"] if plan.get("split_entry_enabled") else active_entry * (1 - plan["sl_price_pct"] / 100)
+        if candle_low <= active_sl:
+            roi = -plan["sl_roi_pct"] * active_weight
             return {"outcome": "sl", "roi_pct": roi - TRADE_COST_ROI_PCT if apply_cost else roi}
-        if float(candle["high"]) >= tp2_price:
-            roi = plan["tp2_roi_pct"]
+        if candle_high >= active_tp2:
+            roi = plan["tp2_roi_pct"] * active_weight
             return {"outcome": "tp2", "roi_pct": roi - TRADE_COST_ROI_PCT if apply_cost else roi}
-        if float(candle["high"]) >= tp1_price:
-            roi = plan["tp1_roi_pct"]
+        if candle_high >= active_tp1:
+            roi = plan["tp1_roi_pct"] * active_weight
             return {"outcome": "tp1", "roi_pct": roi - TRADE_COST_ROI_PCT if apply_cost else roi}
 
     final_close = float(future["close"].iloc[-1])
-    roi_pct = ((final_close - plan["entry_price"]) / plan["entry_price"]) * 100 * LEVERAGE
+    roi_pct = ((final_close - active_entry) / active_entry) * 100 * LEVERAGE * active_weight
     if apply_cost:
         roi_pct -= TRADE_COST_ROI_PCT
     return {"outcome": "timeout", "roi_pct": roi_pct}
@@ -749,13 +860,14 @@ def summarize_trades(trades: list[dict]) -> dict:
     }
 
 
-def collect_signal_indexes(rsi_series: pd.Series, limit: float, start: int, end: int, cooldown: int) -> list[int]:
+def collect_signal_indexes(rsi_series: pd.Series, level_key: str, start: int, end: int, cooldown: int) -> list[int]:
     signal_indexes = []
     last_signal_index = -cooldown
     for index in range(start, end):
         if index - last_signal_index < cooldown:
             continue
-        if pd.notna(rsi_series.iloc[index]) and float(rsi_series.iloc[index]) < limit:
+        passed, _ = rsi_recovery_signal(rsi_series.iloc[: index + 1], level_key)
+        if passed:
             signal_indexes.append(index)
             last_signal_index = index
     return signal_indexes[-BACKTEST_MAX_SIGNALS:]
@@ -773,6 +885,7 @@ def simulate_signals(
     for index in signal_indexes:
         historical_df = df.iloc[: index + 1]
         historical_rsi = float(rsi_series.iloc[index])
+        _, recovery = rsi_recovery_signal(rsi_series.iloc[: index + 1], level_key)
         context = calc_context_score(historical_df, rsi_series.iloc[: index + 1], tf_label)
         plan = build_trade_plan(
             historical_df,
@@ -781,6 +894,7 @@ def simulate_signals(
             level_key,
             params=params,
             context=context,
+            recovery=recovery,
         )
         outcome = simulate_trade_outcome(df, index, plan, tf_label)
         if outcome["outcome"] != "open":
@@ -844,7 +958,6 @@ def select_params_by_train(
 
 def evaluate_backtest(df: pd.DataFrame, rsi_series: pd.Series, tf_label: str, level_key: str) -> dict:
     """Backtest walk-forward com validacao fora da amostra."""
-    limit = RSI_EXTREME_LIMIT if level_key == "extreme" else RSI_WARNING_LIMIT
     start = max(80, RSI_PERIOD + 50)
     horizon = BACKTEST_LOOKAHEAD.get(tf_label, 16)
     cooldown = BACKTEST_SIGNAL_COOLDOWN or horizon
@@ -853,7 +966,7 @@ def evaluate_backtest(df: pd.DataFrame, rsi_series: pd.Series, tf_label: str, le
     if end <= start:
         return summarize_trades([])
 
-    signal_indexes = collect_signal_indexes(rsi_series, limit, start, end, cooldown)
+    signal_indexes = collect_signal_indexes(rsi_series, level_key, start, end, cooldown)
     if not signal_indexes:
         return summarize_trades([])
 
@@ -1190,7 +1303,8 @@ def scan_one_rsi(symbol: str, tf_label: str, tf_interval: str, now_slot: str) ->
             [],
         )
 
-    rsi = calc_rsi(df["close"]).dropna()
+    rsi_series = calc_rsi(df["close"])
+    rsi = rsi_series.dropna()
     if rsi.empty:
         return (
             {
@@ -1205,11 +1319,18 @@ def scan_one_rsi(symbol: str, tf_label: str, tf_interval: str, now_slot: str) ->
 
     update_market_context(symbol, tf_label, df)
     value = float(rsi.iloc[-1])
-    triggered_levels = [level for level in ALERT_LEVELS if value < level["limit"]]
+    recovery_by_level = {}
+    triggered_levels = []
+    for level in ALERT_LEVELS:
+        passed, recovery = rsi_recovery_signal(rsi_series, level["key"])
+        recovery_by_level[level["key"]] = recovery
+        if passed:
+            triggered_levels.append(level)
     plan_level = "extreme" if any(level["key"] == "extreme" for level in triggered_levels) else "warning"
     backtest_stats = get_strategy_stats(symbol, tf_label, plan_level) if triggered_levels else None
     plan_params = backtest_stats.get("selected_params") if backtest_stats else None
-    context = calc_context_score(df, calc_rsi(df["close"]), tf_label, symbol) if triggered_levels else None
+    context = calc_context_score(df, rsi_series, tf_label, symbol) if triggered_levels else None
+    recovery = recovery_by_level.get(plan_level) if triggered_levels else None
     plan = build_trade_plan(
         df,
         value,
@@ -1218,6 +1339,7 @@ def scan_one_rsi(symbol: str, tf_label: str, tf_interval: str, now_slot: str) ->
         backtest_stats,
         params=plan_params,
         context=context,
+        recovery=recovery,
     )
     item = {
         "symbol": symbol,
@@ -1226,6 +1348,7 @@ def scan_one_rsi(symbol: str, tf_label: str, tf_interval: str, now_slot: str) ->
         "price": round(float(df["close"].iloc[-1]), 8),
         "alert": bool(triggered_levels),
         "alert_levels": [level["key"] for level in triggered_levels],
+        "rsi_recovery": recovery_by_level,
         "already_alerted_this_hour": [
             level["key"]
             for level in triggered_levels
@@ -1248,12 +1371,12 @@ def scan_one_rsi(symbol: str, tf_label: str, tf_interval: str, now_slot: str) ->
                     "tf": tf_label,
                     "rsi": value,
                     "key": key,
-                            "level": level["key"],
-                            "limit": level["limit"],
-                            "price": float(df["close"].iloc[-1]),
-                            "trade_plan": plan,
-                        }
-                    )
+                    "level": level["key"],
+                    "limit": level["limit"],
+                    "price": float(df["close"].iloc[-1]),
+                    "trade_plan": plan,
+                }
+            )
 
     return item, alerts
 
@@ -1391,10 +1514,22 @@ def build_email_html(alerts: list[dict], alert_level: dict) -> str:
         plan = alert["trade_plan"]
         plan_notes = "<br>".join(html.escape(note) for note in plan["notes"])
         if plan["qualified"]:
+            if plan.get("split_entry_enabled"):
+                entry_html = f"""
+                <strong>Entrada 1:</strong> {price_fmt(plan['first_entry_price'])}
+                ({plan['first_entry_size_pct']:.0f}% da mao)<br>
+                <strong>Entrada 2:</strong> {price_fmt(plan['second_entry_price'])}
+                ({plan['second_entry_size_pct']:.0f}% da mao se cair ~-{pct_fmt(plan['second_entry_roi_drop_pct'])} em {plan['leverage']:g}x)<br>
+                <strong>Preco medio:</strong> {price_fmt(plan['average_entry_price'])}<br>
+                """
+            else:
+                entry_html = f"""
+                <strong>Entrada:</strong> {price_fmt(plan['entry_price'])}
+                <span style="color:#777">(zona {price_fmt(plan['entry_zone_low'])} - {price_fmt(plan['entry_zone_high'])})</span><br>
+                """
             plan_html = f"""
             <strong>Score:</strong> {plan['score']}/95 ({html.escape(plan['confidence'])})<br>
-            <strong>Entrada:</strong> {price_fmt(plan['entry_price'])}
-            <span style="color:#777">(zona {price_fmt(plan['entry_zone_low'])} - {price_fmt(plan['entry_zone_high'])})</span><br>
+            {entry_html}
             <strong>TP1:</strong> {price_fmt(plan['tp1_price'])} (+{pct_fmt(plan['tp1_price_pct'])}; ~{pct_fmt(plan['tp1_roi_pct'])} em {plan['leverage']:g}x)<br>
             <strong>TP2:</strong> {price_fmt(plan['tp2_price'])} (+{pct_fmt(plan['tp2_price_pct'])}; ~{pct_fmt(plan['tp2_roi_pct'])} em {plan['leverage']:g}x)<br>
             <strong>SL:</strong> {price_fmt(plan['sl_price'])} (-{pct_fmt(plan['sl_price_pct'])}; ~-{pct_fmt(plan['sl_roi_pct'])} em {plan['leverage']:g}x)<br>
@@ -1607,6 +1742,8 @@ def rsi_status():
                 "rsi_period": RSI_PERIOD,
                 "rsi_warning_limit": RSI_WARNING_LIMIT,
                 "rsi_extreme_limit": RSI_EXTREME_LIMIT,
+                "rsi_recovery_lookback": RSI_RECOVERY_LOOKBACK,
+                "rsi_recovery_buffer": RSI_RECOVERY_BUFFER,
                 "check_interval_min": CHECK_INTERVAL_MIN,
                 "http_timeout_seconds": HTTP_TIMEOUT_SECONDS,
                 "scan_max_workers": SCAN_MAX_WORKERS,
@@ -1625,6 +1762,9 @@ def rsi_status():
                 "context_min_score": CONTEXT_MIN_SCORE,
                 "context_min_filters": CONTEXT_MIN_FILTERS,
                 "trade_cost_roi_pct": TRADE_COST_ROI_PCT,
+                "split_entry_enabled": SPLIT_ENTRY_ENABLED,
+                "split_entry_first_size_pct": SPLIT_ENTRY_FIRST_SIZE_PCT,
+                "split_entry_second_roi_drop": SPLIT_ENTRY_SECOND_ROI_DROP,
                 "optimize_trade_params": OPTIMIZE_TRADE_PARAMS,
                 "tp1_roi_grid": TP1_ROI_GRID,
                 "tp2_roi_grid": TP2_ROI_GRID,

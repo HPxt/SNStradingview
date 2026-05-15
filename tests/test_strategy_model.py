@@ -65,6 +65,43 @@ class StrategyModelTests(unittest.TestCase):
         self.assertIn("overfit_warning", stats)
         self.assertGreaterEqual(stats["sample_size"], 0)
 
+    def test_rsi_recovery_accepts_cross_up(self):
+        rsi = pd.Series([55, 48, 41, 36, 34, 38, 39, 40.5])
+        passed, recovery = main.rsi_recovery_signal(rsi, "warning")
+
+        self.assertTrue(passed)
+        self.assertTrue(recovery["crossed_up"])
+
+    def test_rsi_recovery_rejects_falling_rsi(self):
+        rsi = pd.Series([55, 48, 41, 39, 38, 36, 34, 33])
+        passed, recovery = main.rsi_recovery_signal(rsi, "warning")
+
+        self.assertFalse(passed)
+        self.assertIn("sem recuperacao", recovery["reason"])
+
+    def test_split_entry_plan_includes_average_price(self):
+        df = make_ohlc()
+        stats = {
+            "sample_size": main.BACKTEST_MIN_TRADES,
+            "win_rate_pct": 70,
+            "avg_roi_pct": 5,
+            "profit_factor": 2,
+            "train_stats": {"sample_size": main.BACKTEST_MIN_TRADES},
+            "overfit_warning": False,
+        }
+        context = {
+            "score": main.CONTEXT_MIN_SCORE,
+            "passed_count": main.CONTEXT_MIN_FILTERS,
+            "total_count": main.CONTEXT_MIN_FILTERS,
+            "passed_filters": ["RSI recuperando"],
+        }
+        plan = main.build_trade_plan(df, 35, "15m", "warning", stats, context=context)
+
+        self.assertTrue(plan["split_entry_enabled"])
+        self.assertLess(plan["second_entry_price"], plan["first_entry_price"])
+        self.assertLess(plan["average_entry_price"], plan["first_entry_price"])
+        self.assertIn("reforco", plan["summary"])
+
     def test_plan_must_be_qualified_to_send(self):
         sendable, reason = main.is_plan_sendable(
             {

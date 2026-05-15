@@ -48,6 +48,8 @@ Opcionais:
 | `RSI_LIMIT` | `40` | Compatibilidade: limite do alerta principal |
 | `RSI_WARNING_LIMIT` | `40` | Dispara alerta quando RSI fica abaixo deste valor |
 | `RSI_EXTREME_LIMIT` | `30` | Dispara alerta extremo separado quando RSI fica abaixo deste valor |
+| `RSI_RECOVERY_LOOKBACK` | `6` | Candles usados para confirmar que o RSI parou de cair |
+| `RSI_RECOVERY_BUFFER` | `2` | Recuperacao minima do RSI a partir do fundo recente |
 | `CHECK_INTERVAL_MIN` | `15` | Intervalo entre verificacoes |
 | `LEVERAGE` | `10` | Alavancagem usada apenas para estimar TP/SL no alerta |
 | `BACKTEST_MIN_TRADES` | `12` | Amostra minima para calibrar confianca pelo backtest |
@@ -64,6 +66,9 @@ Opcionais:
 | `CONTEXT_MIN_SCORE` | `55` | Score minimo dos filtros de contexto tecnico |
 | `CONTEXT_MIN_FILTERS` | `4` | Quantidade minima de filtros alinhados para validar a call |
 | `TRADE_COST_ROI_PCT` | `1.2` | Custo estimado por trade em ROI alavancado, usado no backtest |
+| `SPLIT_ENTRY_ENABLED` | `true` | Mostra e testa entrada dividida em duas partes |
+| `SPLIT_ENTRY_FIRST_SIZE_PCT` | `50` | Percentual da mao na primeira entrada |
+| `SPLIT_ENTRY_SECOND_ROI_DROP` | `80` | Queda em ROI alavancado para completar a mao |
 | `OPTIMIZE_TRADE_PARAMS` | `true` | Testa combinacoes de TP/SL no treino e valida fora da amostra |
 | `TP1_ROI_GRID` | `25,35` | Grade de TP1 em ROI alavancado para otimizacao |
 | `TP2_ROI_GRID` | `45,65` | Grade de TP2 em ROI alavancado para otimizacao |
@@ -72,7 +77,7 @@ Opcionais:
 | `BINANCE_BASE_URLS` | `https://data-api.binance.vision,https://api1.binance.com,https://api.binance.com` | URLs da Binance para tentar em ordem |
 | `DISABLE_SCHEDULER` | vazio | Use `true` para desativar o agendador |
 
-Os planos de entrada/TP/SL enviados por e-mail sao educativos e baseados em indicadores tecnicos. Por padrao, o app so envia e-mail quando a call completa passa os filtros minimos de assertividade, ROI, payoff, score e confianca. Candidatos recusados podem ser vistos em `/rsi`, mas nao viram e-mail. O relatorio `/model-report` mostra a quantidade de dados por timeframe, o que passou e o que foi recusado. O historico `/model-history` mostra a evolucao da nota geral de 0 a 100 e das notas por componente. Eles nao executam ordens e nao substituem gestao de risco.
+Os planos de entrada/TP/SL enviados por e-mail sao educativos e baseados em indicadores tecnicos. Por padrao, o app so envia e-mail quando a call completa passa os filtros minimos de assertividade, ROI, payoff, score, confianca e confirmacao de recuperacao do RSI. A entrada dividida tambem entra no backtest: primeira parte no preco atual e segunda parte apenas se o preco cair o equivalente ao ROI configurado. Candidatos recusados podem ser vistos em `/rsi`, mas nao viram e-mail. O relatorio `/model-report` mostra a quantidade de dados por timeframe, o que passou e o que foi recusado. O historico `/model-history` mostra a evolucao da nota geral de 0 a 100 e das notas por componente. Eles nao executam ordens e nao substituem gestao de risco.
 
 ## Configurar Gmail
 
