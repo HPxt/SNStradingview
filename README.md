@@ -68,7 +68,7 @@ Opcionais:
 | `TRADE_COST_ROI_PCT` | `1.2` | Custo estimado por trade em ROI alavancado, usado no backtest |
 | `SPLIT_ENTRY_ENABLED` | `true` | Mostra e testa entrada dividida em duas partes |
 | `SPLIT_ENTRY_FIRST_SIZE_PCT` | `50` | Percentual da mao na primeira entrada |
-| `SPLIT_ENTRY_SECOND_ROI_DROP` | `80` | Queda em ROI alavancado para completar a mao |
+| `SPLIT_ENTRY_SECOND_ROI_DROP` | `120` | Queda em ROI alavancado para completar a mao. Em 10x, `120` equivale a ~12% de queda no preco |
 | `OPTIMIZE_TRADE_PARAMS` | `true` | Testa combinacoes de TP/SL no treino e valida fora da amostra |
 | `TP1_ROI_GRID` | `25,35` | Grade de TP1 em ROI alavancado para otimizacao |
 | `TP2_ROI_GRID` | `45,65` | Grade de TP2 em ROI alavancado para otimizacao |

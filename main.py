@@ -68,7 +68,7 @@ SPLIT_ENTRY_ENABLED = os.getenv("SPLIT_ENTRY_ENABLED", "true").lower() in {
     "yes",
 }
 SPLIT_ENTRY_FIRST_SIZE_PCT = float(os.getenv("SPLIT_ENTRY_FIRST_SIZE_PCT", "50"))
-SPLIT_ENTRY_SECOND_ROI_DROP = float(os.getenv("SPLIT_ENTRY_SECOND_ROI_DROP", "80"))
+SPLIT_ENTRY_SECOND_ROI_DROP = float(os.getenv("SPLIT_ENTRY_SECOND_ROI_DROP", "120"))
 OPTIMIZE_TRADE_PARAMS = os.getenv("OPTIMIZE_TRADE_PARAMS", "true").lower() in {
     "1",
     "true",
