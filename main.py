@@ -117,7 +117,7 @@ def get_candles(symbol: str, interval: str, limit: int = CANDLE_LIMIT) -> pd.Dat
                     "ignore",
                 ],
             )
-            df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            df = df.assign(close=pd.to_numeric(df["close"], errors="coerce"))
             df = df.dropna(subset=["close"])
             if not df.empty:
                 _last_candle_errors.pop(f"{symbol}_{interval}", None)
@@ -143,21 +143,21 @@ def calc_rsi(series: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
-    avg_gain = gain.rolling(period, min_periods=period).mean()
-    avg_loss = loss.rolling(period, min_periods=period).mean()
+    avg_gain_values = [None] * len(series)
+    avg_loss_values = [None] * len(series)
 
-    first_valid = avg_gain.first_valid_index()
-    if first_valid is not None:
-        start_pos = avg_gain.index.get_loc(first_valid) + 1
-        for i in range(start_pos, len(series)):
-            prev_index = avg_gain.index[i - 1]
-            current_index = avg_gain.index[i]
-            avg_gain.loc[current_index] = (
-                (avg_gain.loc[prev_index] * (period - 1)) + gain.loc[current_index]
-            ) / period
-            avg_loss.loc[current_index] = (
-                (avg_loss.loc[prev_index] * (period - 1)) + loss.loc[current_index]
-            ) / period
+    if len(series) > period:
+        gain_values = gain.fillna(0).tolist()
+        loss_values = loss.fillna(0).tolist()
+        avg_gain_values[period] = sum(gain_values[1 : period + 1]) / period
+        avg_loss_values[period] = sum(loss_values[1 : period + 1]) / period
+
+        for i in range(period + 1, len(series)):
+            avg_gain_values[i] = ((avg_gain_values[i - 1] * (period - 1)) + gain_values[i]) / period
+            avg_loss_values[i] = ((avg_loss_values[i - 1] * (period - 1)) + loss_values[i]) / period
+
+    avg_gain = pd.Series(avg_gain_values, index=series.index, dtype="float64")
+    avg_loss = pd.Series(avg_loss_values, index=series.index, dtype="float64")
 
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
