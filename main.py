@@ -52,6 +52,7 @@ BACKTEST_VALIDATION_RATIO = float(os.getenv("BACKTEST_VALIDATION_RATIO", "0.35")
 BACKTEST_SIGNAL_COOLDOWN = int(os.getenv("BACKTEST_SIGNAL_COOLDOWN", "0"))
 TRAINING_INTERVAL_MIN = int(os.getenv("TRAINING_INTERVAL_MIN", "180"))
 TRAINING_CANDLE_LIMIT = int(os.getenv("TRAINING_CANDLE_LIMIT", "3000"))
+MODEL_HISTORY_LIMIT = int(os.getenv("MODEL_HISTORY_LIMIT", "50"))
 PLAN_MIN_WIN_RATE = float(os.getenv("PLAN_MIN_WIN_RATE", "60"))
 PLAN_MIN_PROFIT_FACTOR = float(os.getenv("PLAN_MIN_PROFIT_FACTOR", "1.25"))
 PLAN_MIN_AVG_ROI = float(os.getenv("PLAN_MIN_AVG_ROI", "0"))
@@ -90,6 +91,7 @@ _strategy_model = {
     "trained_at_utc": None,
     "running": False,
     "stats": {},
+    "history": [],
 }
 
 ALERT_LEVELS = [
@@ -619,6 +621,78 @@ def train_one_strategy(symbol: str, tf_label: str, tf_interval: str) -> dict:
     return results
 
 
+def clamp(value: float, low: float = 0, high: float = 100) -> float:
+    return max(low, min(high, value))
+
+
+def average(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def score_model_snapshot(stats: dict) -> dict:
+    items = list(stats.values())
+    if not items:
+        return {
+            "overall_score": 0,
+            "win_rate_score": 0,
+            "profit_factor_score": 0,
+            "roi_score": 0,
+            "coverage_score": 0,
+            "overfit_score": 0,
+            "qualified_count": 0,
+            "total_count": 0,
+        }
+
+    qualified = [item for item in items if item.get("qualified")]
+    sample_items = [item for item in items if item.get("sample_size", 0) > 0]
+    avg_win_rate = average([item.get("win_rate_pct", 0) for item in sample_items])
+    avg_profit_factor = average([min(item.get("profit_factor", 0), 3) for item in sample_items])
+    avg_roi = average([item.get("avg_roi_pct", 0) for item in sample_items])
+    avg_validation_sample = average([item.get("sample_size", 0) for item in items])
+    avg_train_sample = average([item.get("train_stats", {}).get("sample_size", 0) for item in items])
+    overfit_warnings = len([item for item in items if item.get("overfit_warning")])
+
+    win_rate_score = clamp((avg_win_rate / PLAN_MIN_WIN_RATE) * 100)
+    profit_factor_score = clamp((avg_profit_factor / PLAN_MIN_PROFIT_FACTOR) * 100)
+    roi_score = clamp(((avg_roi + 5) / 10) * 100)
+    coverage_score = clamp(
+        (
+            min(avg_validation_sample / BACKTEST_MIN_TRADES, 1)
+            * min(avg_train_sample / BACKTEST_MIN_TRADES, 1)
+        )
+        * 100
+    )
+    overfit_score = clamp(100 - ((overfit_warnings / len(items)) * 100))
+    qualified_score = clamp((len(qualified) / len(items)) * 100)
+    overall_score = round(
+        (win_rate_score * 0.25)
+        + (profit_factor_score * 0.2)
+        + (roi_score * 0.2)
+        + (coverage_score * 0.15)
+        + (overfit_score * 0.1)
+        + (qualified_score * 0.1),
+        2,
+    )
+
+    return {
+        "overall_score": overall_score,
+        "win_rate_score": round(win_rate_score, 2),
+        "profit_factor_score": round(profit_factor_score, 2),
+        "roi_score": round(roi_score, 2),
+        "coverage_score": round(coverage_score, 2),
+        "overfit_score": round(overfit_score, 2),
+        "qualified_score": round(qualified_score, 2),
+        "avg_win_rate_pct": round(avg_win_rate, 2),
+        "avg_profit_factor": round(avg_profit_factor, 2),
+        "avg_roi_pct": round(avg_roi, 2),
+        "avg_validation_sample": round(avg_validation_sample, 2),
+        "avg_train_sample": round(avg_train_sample, 2),
+        "overfit_warnings": overfit_warnings,
+        "qualified_count": len(qualified),
+        "total_count": len(items),
+    }
+
+
 def train_strategy_model() -> bool:
     """Treina/calibra as estatisticas historicas em background."""
     if not _model_lock.acquire(blocking=False):
@@ -648,13 +722,25 @@ def train_strategy_model() -> bool:
             for future in as_completed(futures):
                 stats.update(future.result())
 
+        trained_at = utc_now().isoformat()
+        snapshot_score = score_model_snapshot(stats)
+        snapshot = {
+            "trained_at_utc": trained_at,
+            **snapshot_score,
+        }
+
         with _model_lock:
-            _strategy_model["trained_at_utc"] = utc_now().isoformat()
+            _strategy_model["trained_at_utc"] = trained_at
             _strategy_model["running"] = False
             _strategy_model["stats"] = stats
+            _strategy_model["history"].append(snapshot)
+            _strategy_model["history"] = _strategy_model["history"][-MODEL_HISTORY_LIMIT:]
 
         qualified_count = len([item for item in stats.values() if item.get("qualified")])
-        print(f"[TREINO] Concluido. Estrategias aprovadas: {qualified_count}/{len(stats)}.")
+        print(
+            f"[TREINO] Concluido. Estrategias aprovadas: {qualified_count}/{len(stats)}. "
+            f"Nota geral: {snapshot_score['overall_score']}/100."
+        )
         return True
     except Exception as exc:
         with _model_lock:
@@ -707,6 +793,7 @@ def build_model_report() -> dict:
     return {
         "trained_at_utc": _strategy_model["trained_at_utc"],
         "running": _strategy_model["running"],
+        "score": score_model_snapshot(stats),
         "total": len(stats),
         "qualified": len(qualified),
         "rejected": len(stats) - len(qualified),
@@ -720,6 +807,46 @@ def build_model_report() -> dict:
             "plan_min_profit_factor": PLAN_MIN_PROFIT_FACTOR,
             "plan_min_avg_roi": PLAN_MIN_AVG_ROI,
             "plan_min_score": PLAN_MIN_SCORE,
+        },
+    }
+
+
+def build_model_history() -> dict:
+    history = _strategy_model["history"]
+    latest = history[-1] if history else None
+    previous = history[-2] if len(history) > 1 else None
+    delta = {}
+
+    if latest and previous:
+        for key in [
+            "overall_score",
+            "win_rate_score",
+            "profit_factor_score",
+            "roi_score",
+            "coverage_score",
+            "overfit_score",
+            "qualified_count",
+            "avg_win_rate_pct",
+            "avg_profit_factor",
+            "avg_roi_pct",
+        ]:
+            delta[key] = round(latest.get(key, 0) - previous.get(key, 0), 2)
+
+    return {
+        "latest": latest,
+        "previous": previous,
+        "delta": delta,
+        "history_count": len(history),
+        "history_limit": MODEL_HISTORY_LIMIT,
+        "history": history,
+        "score_explanation": {
+            "overall_score": "media ponderada de assertividade, payoff, ROI, cobertura, overfitting e quantidade aprovada",
+            "win_rate_score": "assertividade media comparada ao minimo configurado",
+            "profit_factor_score": "profit factor medio comparado ao minimo configurado",
+            "roi_score": "ROI medio simulado normalizado",
+            "coverage_score": "qualidade/tamanho medio das amostras de treino e validacao",
+            "overfit_score": "100 menos a proporcao de estrategias com alerta de overfitting",
+            "qualified_score": "percentual de estrategias que passaram em todos os filtros",
         },
     }
 
@@ -1127,6 +1254,12 @@ def model_report():
     return jsonify(build_model_report())
 
 
+@app.route("/model-history")
+def model_history():
+    """Historico de notas dos treinos do modelo."""
+    return jsonify(build_model_history())
+
+
 @app.route("/rsi")
 def rsi_status():
     """Mostra os RSI que o app calculou por ultimo, sem travar em consultas externas."""
@@ -1149,6 +1282,7 @@ def rsi_status():
                 "backtest_signal_cooldown": BACKTEST_SIGNAL_COOLDOWN,
                 "training_interval_min": TRAINING_INTERVAL_MIN,
                 "training_candle_limit": TRAINING_CANDLE_LIMIT,
+                "model_history_limit": MODEL_HISTORY_LIMIT,
                 "plan_min_win_rate": PLAN_MIN_WIN_RATE,
                 "plan_min_profit_factor": PLAN_MIN_PROFIT_FACTOR,
                 "plan_min_avg_roi": PLAN_MIN_AVG_ROI,
@@ -1172,6 +1306,8 @@ def rsi_status():
                 ),
                 "total_count": len(_strategy_model["stats"]),
                 "report_url": "/model-report",
+                "history_url": "/model-history",
+                "latest_score": _strategy_model["history"][-1] if _strategy_model["history"] else None,
                 "stats": _strategy_model["stats"],
             },
             "pending_alerts": _last_scan["pending_alerts"],
