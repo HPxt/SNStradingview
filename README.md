@@ -50,6 +50,8 @@ Opcionais:
 | `RSI_EXTREME_LIMIT` | `30` | Dispara alerta extremo separado quando RSI fica abaixo deste valor |
 | `CHECK_INTERVAL_MIN` | `15` | Intervalo entre verificacoes |
 | `LEVERAGE` | `10` | Alavancagem usada apenas para estimar TP/SL no alerta |
+| `BACKTEST_MIN_TRADES` | `5` | Amostra minima para calibrar confianca pelo backtest |
+| `BACKTEST_MAX_SIGNALS` | `80` | Maximo de sinais historicos avaliados por par/timeframe |
 | `BINANCE_BASE_URLS` | `https://data-api.binance.vision,https://api1.binance.com,https://api.binance.com` | URLs da Binance para tentar em ordem |
 | `DISABLE_SCHEDULER` | vazio | Use `true` para desativar o agendador |
 

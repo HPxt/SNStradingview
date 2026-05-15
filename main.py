@@ -46,6 +46,8 @@ RSI_WARNING_LIMIT = float(os.getenv("RSI_WARNING_LIMIT", os.getenv("RSI_LIMIT", 
 RSI_EXTREME_LIMIT = float(os.getenv("RSI_EXTREME_LIMIT", "30"))
 CHECK_INTERVAL_MIN = int(os.getenv("CHECK_INTERVAL_MIN", "15"))
 LEVERAGE = float(os.getenv("LEVERAGE", "10"))
+BACKTEST_MIN_TRADES = int(os.getenv("BACKTEST_MIN_TRADES", "5"))
+BACKTEST_MAX_SIGNALS = int(os.getenv("BACKTEST_MAX_SIGNALS", "80"))
 
 BINANCE_BASE_URLS = [
     url.strip().rstrip("/")
@@ -95,6 +97,13 @@ TIMEFRAME_PRIORITY = {
     "1h": 2,
     "4h": 3,
     "1d": 4,
+}
+
+BACKTEST_LOOKAHEAD = {
+    "15m": 16,
+    "1h": 16,
+    "4h": 12,
+    "1d": 10,
 }
 
 
@@ -218,7 +227,13 @@ def pct_fmt(value: float) -> str:
     return f"{value:.2f}%"
 
 
-def build_trade_plan(df: pd.DataFrame, rsi_value: float, tf_label: str, level_key: str) -> dict:
+def build_trade_plan(
+    df: pd.DataFrame,
+    rsi_value: float,
+    tf_label: str,
+    level_key: str,
+    backtest_stats: dict | None = None,
+) -> dict:
     """Gera um plano tecnico educacional, sem automatizar ordem."""
     close = float(df["close"].iloc[-1])
     atr_series = calc_atr(df)
@@ -293,6 +308,27 @@ def build_trade_plan(df: pd.DataFrame, rsi_value: float, tf_label: str, level_ke
         f"ATR aprox.: {pct_fmt(atr_pct)}",
     ]
 
+    if backtest_stats and backtest_stats["sample_size"] >= BACKTEST_MIN_TRADES:
+        win_rate = backtest_stats["win_rate_pct"]
+        if win_rate >= 65:
+            confidence = "alta"
+            score = min(score + 8, 95)
+        elif win_rate >= 52:
+            confidence = "media" if confidence == "baixa" else confidence
+            score = min(score + 3, 95)
+        else:
+            confidence = "baixa"
+            score = max(score - 12, 0)
+
+        notes.append(
+            f"Backtest local: {pct_fmt(win_rate)} assertividade em {backtest_stats['sample_size']} sinais"
+        )
+        notes.append(
+            f"ROI medio simulado: {pct_fmt(backtest_stats['avg_roi_pct'])}; payoff {backtest_stats['profit_factor']:.2f}"
+        )
+    else:
+        notes.append("Backtest local: amostra insuficiente para calibrar confianca")
+
     return {
         "side": "long educativo",
         "leverage": LEVERAGE,
@@ -313,12 +349,81 @@ def build_trade_plan(df: pd.DataFrame, rsi_value: float, tf_label: str, level_ke
         "atr_pct": atr_pct,
         "range_position": round(range_position, 3),
         "notes": notes,
+        "backtest": backtest_stats,
         "summary": (
             f"Entrada ref. {price_fmt(entry_price)} | "
             f"TP1 +{pct_fmt(tp1_price_pct)} (~{pct_fmt(tp1_roi_pct)} em {LEVERAGE:g}x) | "
             f"TP2 +{pct_fmt(tp2_price_pct)} (~{pct_fmt(tp2_roi_pct)} em {LEVERAGE:g}x) | "
             f"SL -{pct_fmt(sl_price_pct)} (~-{pct_fmt(sl_roi_pct)} em {LEVERAGE:g}x)"
         ),
+    }
+
+
+def simulate_trade_outcome(df: pd.DataFrame, start_index: int, plan: dict, tf_label: str) -> dict:
+    """Simula TP/SL apos um sinal historico. Se TP e SL baterem no mesmo candle, usa SL."""
+    horizon = BACKTEST_LOOKAHEAD.get(tf_label, 16)
+    future = df.iloc[start_index + 1 : start_index + 1 + horizon]
+    if future.empty:
+        return {"outcome": "open", "roi_pct": 0.0}
+
+    tp1_price = plan["tp1_price"]
+    tp2_price = plan["tp2_price"]
+    sl_price = plan["sl_price"]
+
+    for _, candle in future.iterrows():
+        if float(candle["low"]) <= sl_price:
+            return {"outcome": "sl", "roi_pct": -plan["sl_roi_pct"]}
+        if float(candle["high"]) >= tp2_price:
+            return {"outcome": "tp2", "roi_pct": plan["tp2_roi_pct"]}
+        if float(candle["high"]) >= tp1_price:
+            return {"outcome": "tp1", "roi_pct": plan["tp1_roi_pct"]}
+
+    final_close = float(future["close"].iloc[-1])
+    roi_pct = ((final_close - plan["entry_price"]) / plan["entry_price"]) * 100 * LEVERAGE
+    return {"outcome": "timeout", "roi_pct": roi_pct}
+
+
+def evaluate_backtest(df: pd.DataFrame, rsi_series: pd.Series, tf_label: str, level_key: str) -> dict:
+    """Backtest walk-forward simples dos sinais RSI com o plano atual."""
+    limit = RSI_EXTREME_LIMIT if level_key == "extreme" else RSI_WARNING_LIMIT
+    start = max(80, RSI_PERIOD + 50)
+    end = len(df) - BACKTEST_LOOKAHEAD.get(tf_label, 16) - 1
+
+    if end <= start:
+        return {"sample_size": 0, "win_rate_pct": 0.0, "avg_roi_pct": 0.0, "profit_factor": 0.0}
+
+    trades = []
+    signal_indexes = [
+        index
+        for index in range(start, end)
+        if pd.notna(rsi_series.iloc[index]) and float(rsi_series.iloc[index]) < limit
+    ][-BACKTEST_MAX_SIGNALS:]
+
+    for index in signal_indexes:
+        historical_df = df.iloc[: index + 1]
+        historical_rsi = float(rsi_series.iloc[index])
+        plan = build_trade_plan(historical_df, historical_rsi, tf_label, level_key)
+        outcome = simulate_trade_outcome(df, index, plan, tf_label)
+        if outcome["outcome"] != "open":
+            trades.append(outcome)
+
+    if not trades:
+        return {"sample_size": 0, "win_rate_pct": 0.0, "avg_roi_pct": 0.0, "profit_factor": 0.0}
+
+    wins = [trade for trade in trades if trade["roi_pct"] > 0]
+    losses = [trade for trade in trades if trade["roi_pct"] < 0]
+    gross_profit = sum(trade["roi_pct"] for trade in wins)
+    gross_loss = abs(sum(trade["roi_pct"] for trade in losses))
+    profit_factor = gross_profit / gross_loss if gross_loss else gross_profit
+
+    return {
+        "sample_size": len(trades),
+        "win_rate_pct": round((len(wins) / len(trades)) * 100, 2),
+        "avg_roi_pct": round(sum(trade["roi_pct"] for trade in trades) / len(trades), 2),
+        "profit_factor": round(profit_factor, 2),
+        "wins": len(wins),
+        "losses": len(losses),
+        "timeouts": len([trade for trade in trades if trade["outcome"] == "timeout"]),
     }
 
 
@@ -353,12 +458,9 @@ def scan_one_rsi(symbol: str, tf_label: str, tf_interval: str, now_slot: str) ->
 
     value = float(rsi.iloc[-1])
     triggered_levels = [level for level in ALERT_LEVELS if value < level["limit"]]
-    plan = build_trade_plan(
-        df,
-        value,
-        tf_label,
-        "extreme" if any(level["key"] == "extreme" for level in triggered_levels) else "warning",
-    )
+    plan_level = "extreme" if any(level["key"] == "extreme" for level in triggered_levels) else "warning"
+    backtest_stats = evaluate_backtest(df, calc_rsi(df["close"]), tf_label, plan_level) if triggered_levels else None
+    plan = build_trade_plan(df, value, tf_label, plan_level, backtest_stats)
     item = {
         "symbol": symbol,
         "tf": tf_label,
@@ -697,6 +799,8 @@ def rsi_status():
                 "http_timeout_seconds": HTTP_TIMEOUT_SECONDS,
                 "scan_max_workers": SCAN_MAX_WORKERS,
                 "leverage": LEVERAGE,
+                "backtest_min_trades": BACKTEST_MIN_TRADES,
+                "backtest_max_signals": BACKTEST_MAX_SIGNALS,
                 "display_timezone": DISPLAY_TIMEZONE,
                 "binance_base_urls": BINANCE_BASE_URLS,
                 "symbols": SYMBOLS,
