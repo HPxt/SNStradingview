@@ -52,7 +52,7 @@ Opcionais:
 | `RSI_RECOVERY_BUFFER` | `2` | Recuperacao minima do RSI a partir do fundo recente |
 | `CHECK_INTERVAL_MIN` | `15` | Intervalo entre verificacoes |
 | `LEVERAGE` | `10` | Alavancagem usada apenas para estimar TP/SL no alerta |
-| `BACKTEST_MIN_TRADES` | `12` | Amostra minima para calibrar confianca pelo backtest |
+| `BACKTEST_MIN_TRADES` | `20` | Amostra minima para calibrar confianca pelo backtest |
 | `BACKTEST_MAX_SIGNALS` | `80` | Maximo de sinais historicos avaliados por par/timeframe |
 | `BACKTEST_VALIDATION_RATIO` | `0.35` | Parte final dos sinais usada como validacao fora da amostra |
 | `BACKTEST_SIGNAL_COOLDOWN` | `0` | Cooldown entre sinais; `0` usa o horizonte do timeframe |

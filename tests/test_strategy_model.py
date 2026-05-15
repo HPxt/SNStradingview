@@ -42,13 +42,13 @@ class StrategyModelTests(unittest.TestCase):
     def test_rejects_overfit_gap(self):
         qualified, reason = main.is_backtest_qualified(
             {
-                "sample_size": 20,
+                "sample_size": main.BACKTEST_MIN_TRADES,
                 "win_rate_pct": 80,
                 "avg_roi_pct": 5,
                 "profit_factor": 2,
                 "overfit_warning": True,
                 "overfit_gap_pct": 30,
-                "train_stats": {"sample_size": 20},
+                "train_stats": {"sample_size": main.BACKTEST_MIN_TRADES},
             }
         )
 
