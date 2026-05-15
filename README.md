@@ -69,6 +69,8 @@ Opcionais:
 | `SPLIT_ENTRY_ENABLED` | `true` | Mostra e testa entrada dividida em duas partes |
 | `SPLIT_ENTRY_FIRST_SIZE_PCT` | `50` | Percentual da mao na primeira entrada |
 | `SPLIT_ENTRY_SECOND_ROI_DROP` | `120` | Queda em ROI alavancado para completar a mao. Em 10x, `120` equivale a ~12% de queda no preco |
+| `SPLIT_ENTRY_SECOND_ROI_GRID_BTC` | `80,100,120` | Grade testada para BTC, com degraus menores |
+| `SPLIT_ENTRY_SECOND_ROI_GRID_ALT` | `100,120,150,180` | Grade testada para altcoins, com mais espaco para volatilidade |
 | `OPTIMIZE_TRADE_PARAMS` | `true` | Testa combinacoes de TP/SL no treino e valida fora da amostra |
 | `TP1_ROI_GRID` | `25,35` | Grade de TP1 em ROI alavancado para otimizacao |
 | `TP2_ROI_GRID` | `45,65` | Grade de TP2 em ROI alavancado para otimizacao |
@@ -77,7 +79,7 @@ Opcionais:
 | `BINANCE_BASE_URLS` | `https://data-api.binance.vision,https://api1.binance.com,https://api.binance.com` | URLs da Binance para tentar em ordem |
 | `DISABLE_SCHEDULER` | vazio | Use `true` para desativar o agendador |
 
-Os planos de entrada/TP/SL enviados por e-mail sao educativos e baseados em indicadores tecnicos. Por padrao, o app so envia e-mail quando a call completa passa os filtros minimos de assertividade, ROI, payoff, score, confianca e confirmacao de recuperacao do RSI. A entrada dividida tambem entra no backtest: primeira parte no preco atual e segunda parte apenas se o preco cair o equivalente ao ROI configurado. Candidatos recusados podem ser vistos em `/rsi`, mas nao viram e-mail. O relatorio `/model-report` mostra a quantidade de dados por timeframe, o que passou e o que foi recusado. O historico `/model-history` mostra a evolucao da nota geral de 0 a 100 e das notas por componente. Eles nao executam ordens e nao substituem gestao de risco.
+Os planos de entrada/TP/SL enviados por e-mail sao educativos e baseados em indicadores tecnicos. Por padrao, o app so envia e-mail quando a call completa passa os filtros minimos de assertividade, ROI, payoff, score, confianca e confirmacao de recuperacao do RSI. A entrada dividida tambem entra no backtest: primeira parte no preco atual e segunda parte apenas se o preco cair o equivalente ao ROI escolhido pelo treino. BTC usa uma grade mais curta; altcoins usam uma grade mais larga por terem volatilidade maior. Candidatos recusados podem ser vistos em `/rsi`, mas nao viram e-mail. O relatorio `/model-report` mostra a quantidade de dados por timeframe, o que passou e o que foi recusado. O historico `/model-history` mostra a evolucao da nota geral de 0 a 100 e das notas por componente. Eles nao executam ordens e nao substituem gestao de risco.
 
 ## Configurar Gmail
 

@@ -102,6 +102,56 @@ class StrategyModelTests(unittest.TestCase):
         self.assertLess(plan["average_entry_price"], plan["first_entry_price"])
         self.assertIn("reforco", plan["summary"])
 
+    def test_split_entry_grid_is_wider_for_alts_than_btc(self):
+        btc_drops = {
+            params["split_second_roi_drop_pct"]
+            for params in main.candidate_param_grid("15m", "warning", "BTCUSDT")
+        }
+        alt_drops = {
+            params["split_second_roi_drop_pct"]
+            for params in main.candidate_param_grid("15m", "warning", "ENAUSDT")
+        }
+
+        self.assertLess(max(btc_drops), max(alt_drops))
+        self.assertGreater(len(alt_drops), len(btc_drops))
+
+    def test_selected_split_drop_changes_second_entry_price(self):
+        df = make_ohlc()
+        stats = {
+            "sample_size": main.BACKTEST_MIN_TRADES,
+            "win_rate_pct": 70,
+            "avg_roi_pct": 5,
+            "profit_factor": 2,
+            "train_stats": {"sample_size": main.BACKTEST_MIN_TRADES},
+            "overfit_warning": False,
+        }
+        context = {
+            "score": main.CONTEXT_MIN_SCORE,
+            "passed_count": main.CONTEXT_MIN_FILTERS,
+            "total_count": main.CONTEXT_MIN_FILTERS,
+            "passed_filters": ["RSI recuperando"],
+        }
+        plan = main.build_trade_plan(
+            df,
+            35,
+            "15m",
+            "warning",
+            stats,
+            params={
+                "tp1_roi_pct": 25,
+                "tp2_roi_pct": 45,
+                "sl_roi_pct": 10,
+                "split_second_roi_drop_pct": 180,
+            },
+            context=context,
+        )
+
+        self.assertEqual(plan["second_entry_roi_drop_pct"], 180)
+        self.assertAlmostEqual(
+            plan["second_entry_price"],
+            plan["first_entry_price"] * (1 - 18 / 100),
+        )
+
     def test_plan_must_be_qualified_to_send(self):
         sendable, reason = main.is_plan_sendable(
             {

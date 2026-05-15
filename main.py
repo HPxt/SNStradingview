@@ -69,6 +69,16 @@ SPLIT_ENTRY_ENABLED = os.getenv("SPLIT_ENTRY_ENABLED", "true").lower() in {
 }
 SPLIT_ENTRY_FIRST_SIZE_PCT = float(os.getenv("SPLIT_ENTRY_FIRST_SIZE_PCT", "50"))
 SPLIT_ENTRY_SECOND_ROI_DROP = float(os.getenv("SPLIT_ENTRY_SECOND_ROI_DROP", "120"))
+SPLIT_ENTRY_SECOND_ROI_GRID_BTC = [
+    float(value)
+    for value in os.getenv("SPLIT_ENTRY_SECOND_ROI_GRID_BTC", "80,100,120").split(",")
+    if value.strip()
+]
+SPLIT_ENTRY_SECOND_ROI_GRID_ALT = [
+    float(value)
+    for value in os.getenv("SPLIT_ENTRY_SECOND_ROI_GRID_ALT", "100,120,150,180").split(",")
+    if value.strip()
+]
 OPTIMIZE_TRADE_PARAMS = os.getenv("OPTIMIZE_TRADE_PARAMS", "true").lower() in {
     "1",
     "true",
@@ -609,10 +619,15 @@ def build_trade_plan(
     else:
         confidence = "baixa"
 
+    split_second_roi_drop = (
+        params.get("split_second_roi_drop_pct", SPLIT_ENTRY_SECOND_ROI_DROP)
+        if params
+        else SPLIT_ENTRY_SECOND_ROI_DROP
+    )
     first_entry_price = close
     first_entry_size_pct = min(max(SPLIT_ENTRY_FIRST_SIZE_PCT, 1), 99)
     second_entry_size_pct = 100 - first_entry_size_pct
-    second_entry_price_pct = SPLIT_ENTRY_SECOND_ROI_DROP / LEVERAGE
+    second_entry_price_pct = split_second_roi_drop / LEVERAGE
     second_entry_price = first_entry_price * (1 - second_entry_price_pct / 100)
     entry_price = first_entry_price
     average_entry_price = first_entry_price
@@ -670,7 +685,7 @@ def build_trade_plan(
         notes.append(
             "Entrada dividida: "
             f"{first_entry_size_pct:.0f}% agora em {price_fmt(first_entry_price)}; "
-            f"{second_entry_size_pct:.0f}% em -{pct_fmt(SPLIT_ENTRY_SECOND_ROI_DROP)} ROI "
+            f"{second_entry_size_pct:.0f}% em -{pct_fmt(split_second_roi_drop)} ROI "
             f"(preco {price_fmt(second_entry_price)}); "
             f"preco medio planejado {price_fmt(average_entry_price)}"
         )
@@ -703,7 +718,8 @@ def build_trade_plan(
                 "Parametros validados: "
                 f"TP1 {pct_fmt(backtest_stats['selected_params']['tp1_roi_pct'])}, "
                 f"TP2 {pct_fmt(backtest_stats['selected_params']['tp2_roi_pct'])}, "
-                f"SL {pct_fmt(backtest_stats['selected_params']['sl_roi_pct'])} em ROI"
+                f"SL {pct_fmt(backtest_stats['selected_params']['sl_roi_pct'])}, "
+                f"segunda entrada -{pct_fmt(backtest_stats['selected_params'].get('split_second_roi_drop_pct', split_second_roi_drop))} ROI"
             )
     else:
         notes.append("Backtest local: amostra insuficiente para calibrar confianca")
@@ -741,7 +757,7 @@ def build_trade_plan(
         "first_entry_size_pct": first_entry_size_pct,
         "second_entry_price": second_entry_price if SPLIT_ENTRY_ENABLED else None,
         "second_entry_size_pct": second_entry_size_pct if SPLIT_ENTRY_ENABLED else 0,
-        "second_entry_roi_drop_pct": SPLIT_ENTRY_SECOND_ROI_DROP if SPLIT_ENTRY_ENABLED else None,
+        "second_entry_roi_drop_pct": split_second_roi_drop if SPLIT_ENTRY_ENABLED else None,
         "average_entry_price": average_entry_price,
         "split_entry_enabled": SPLIT_ENTRY_ENABLED,
         "entry_zone_low": entry_zone_low,
@@ -902,24 +918,33 @@ def simulate_signals(
     return trades
 
 
-def candidate_param_grid(tf_label: str, level_key: str) -> list[dict]:
+def candidate_param_grid(tf_label: str, level_key: str, symbol: str | None = None) -> list[dict]:
     priority = TIMEFRAME_PRIORITY.get(tf_label, 1)
     extreme_bonus = 8 if level_key == "extreme" else 0
+    split_grid = (
+        SPLIT_ENTRY_SECOND_ROI_GRID_BTC
+        if symbol == "BTCUSDT"
+        else SPLIT_ENTRY_SECOND_ROI_GRID_ALT
+    )
+    if not SPLIT_ENTRY_ENABLED:
+        split_grid = [SPLIT_ENTRY_SECOND_ROI_DROP]
     candidates = []
     for tp1 in TP1_ROI_GRID:
         for tp2 in TP2_ROI_GRID:
             for sl in SL_ROI_GRID:
-                tp1_adj = tp1 + ((priority - 1) * 5) + extreme_bonus
-                tp2_adj = tp2 + ((priority - 1) * 8) + extreme_bonus
-                if tp2_adj <= tp1_adj:
-                    continue
-                candidates.append(
-                    {
-                        "tp1_roi_pct": tp1_adj,
-                        "tp2_roi_pct": tp2_adj,
-                        "sl_roi_pct": sl,
-                    }
-                )
+                for split_drop in split_grid:
+                    tp1_adj = tp1 + ((priority - 1) * 5) + extreme_bonus
+                    tp2_adj = tp2 + ((priority - 1) * 8) + extreme_bonus
+                    if tp2_adj <= tp1_adj:
+                        continue
+                    candidates.append(
+                        {
+                            "tp1_roi_pct": tp1_adj,
+                            "tp2_roi_pct": tp2_adj,
+                            "sl_roi_pct": sl,
+                            "split_second_roi_drop_pct": split_drop,
+                        }
+                    )
     return candidates
 
 
@@ -929,6 +954,7 @@ def select_params_by_train(
     train_indexes: list[int],
     tf_label: str,
     level_key: str,
+    symbol: str | None = None,
 ) -> tuple[dict | None, dict]:
     if not OPTIMIZE_TRADE_PARAMS or not train_indexes:
         return None, summarize_trades(simulate_signals(df, rsi_series, train_indexes, tf_label, level_key))
@@ -937,7 +963,7 @@ def select_params_by_train(
     best_stats = summarize_trades([])
     best_score = -10**9
 
-    for params in candidate_param_grid(tf_label, level_key):
+    for params in candidate_param_grid(tf_label, level_key, symbol):
         trades = simulate_signals(df, rsi_series, train_indexes, tf_label, level_key, params)
         stats = summarize_trades(trades)
         if stats["sample_size"] < max(3, BACKTEST_MIN_TRADES // 2):
@@ -947,6 +973,7 @@ def select_params_by_train(
             + (stats["avg_roi_pct"] * 0.8)
             + (min(stats["profit_factor"], 3) * 6)
             - (params["sl_roi_pct"] * 0.15)
+            - (params.get("split_second_roi_drop_pct", SPLIT_ENTRY_SECOND_ROI_DROP) * 0.015)
         )
         if score > best_score:
             best_score = score
@@ -956,7 +983,13 @@ def select_params_by_train(
     return best_params, best_stats
 
 
-def evaluate_backtest(df: pd.DataFrame, rsi_series: pd.Series, tf_label: str, level_key: str) -> dict:
+def evaluate_backtest(
+    df: pd.DataFrame,
+    rsi_series: pd.Series,
+    tf_label: str,
+    level_key: str,
+    symbol: str | None = None,
+) -> dict:
     """Backtest walk-forward com validacao fora da amostra."""
     start = max(80, RSI_PERIOD + 50)
     horizon = BACKTEST_LOOKAHEAD.get(tf_label, 16)
@@ -981,6 +1014,7 @@ def evaluate_backtest(df: pd.DataFrame, rsi_series: pd.Series, tf_label: str, le
         train_indexes,
         tf_label,
         level_key,
+        symbol,
     )
     train_trades = simulate_signals(df, rsi_series, train_indexes, tf_label, level_key, selected_params)
     validation_trades = simulate_signals(
@@ -1034,7 +1068,7 @@ def train_one_strategy(symbol: str, tf_label: str, tf_interval: str) -> dict:
 
     rsi_series = calc_rsi(df["close"])
     for level in ALERT_LEVELS:
-        stats = evaluate_backtest(df, rsi_series, tf_label, level["key"])
+        stats = evaluate_backtest(df, rsi_series, tf_label, level["key"], symbol)
         qualified, reason = is_backtest_qualified(stats)
         stats.update(
             {
@@ -1765,6 +1799,8 @@ def rsi_status():
                 "split_entry_enabled": SPLIT_ENTRY_ENABLED,
                 "split_entry_first_size_pct": SPLIT_ENTRY_FIRST_SIZE_PCT,
                 "split_entry_second_roi_drop": SPLIT_ENTRY_SECOND_ROI_DROP,
+                "split_entry_second_roi_grid_btc": SPLIT_ENTRY_SECOND_ROI_GRID_BTC,
+                "split_entry_second_roi_grid_alt": SPLIT_ENTRY_SECOND_ROI_GRID_ALT,
                 "optimize_trade_params": OPTIMIZE_TRADE_PARAMS,
                 "tp1_roi_grid": TP1_ROI_GRID,
                 "tp2_roi_grid": TP2_ROI_GRID,
