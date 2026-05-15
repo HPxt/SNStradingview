@@ -39,14 +39,21 @@ RSI_WARNING_LIMIT = float(os.getenv("RSI_WARNING_LIMIT", os.getenv("RSI_LIMIT", 
 RSI_EXTREME_LIMIT = float(os.getenv("RSI_EXTREME_LIMIT", "30"))
 CHECK_INTERVAL_MIN = int(os.getenv("CHECK_INTERVAL_MIN", "15"))
 
-BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
-BINANCE_KLINES_URL = f"{BINANCE_BASE_URL.rstrip('/')}/api/v3/klines"
+BINANCE_BASE_URLS = [
+    url.strip().rstrip("/")
+    for url in os.getenv(
+        "BINANCE_BASE_URLS",
+        "https://data-api.binance.vision,https://api1.binance.com,https://api.binance.com",
+    ).split(",")
+    if url.strip()
+]
 HTTP_TIMEOUT_SECONDS = 10
 CANDLE_LIMIT = max(RSI_PERIOD + 50, 100)
 
 # Controle para nao enviar e-mail duplicado na mesma janela.
 _alerted = set()
 _scheduler: BackgroundScheduler | None = None
+_last_candle_errors = {}
 
 ALERT_LEVELS = [
     {
@@ -74,41 +81,50 @@ def utc_now() -> datetime:
 
 def get_candles(symbol: str, interval: str, limit: int = CANDLE_LIMIT) -> pd.DataFrame | None:
     """Busca candles publicos da Binance Spot."""
-    try:
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        response = requests.get(BINANCE_KLINES_URL, params=params, timeout=HTTP_TIMEOUT_SECONDS)
-        response.raise_for_status()
+    errors = []
 
-        df = pd.DataFrame(
-            response.json(),
-            columns=[
-                "time",
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-                "close_time",
-                "quote_asset_volume",
-                "trades",
-                "taker_buy_base",
-                "taker_buy_quote",
-                "ignore",
-            ],
-        )
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-        df = df.dropna(subset=["close"])
-        return df if not df.empty else None
-    except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else "sem status"
-        print(f"[ERRO] Binance {symbol} {interval}: HTTP {status} - {exc}")
-        return None
-    except requests.RequestException as exc:
-        print(f"[ERRO] Binance {symbol} {interval}: {exc}")
-        return None
-    except Exception as exc:
-        print(f"[ERRO] Candles {symbol} {interval}: {exc}")
-        return None
+    for base_url in BINANCE_BASE_URLS:
+        klines_url = f"{base_url}/api/v3/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        try:
+            response = requests.get(klines_url, params=params, timeout=HTTP_TIMEOUT_SECONDS)
+            response.raise_for_status()
+
+            df = pd.DataFrame(
+                response.json(),
+                columns=[
+                    "time",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "close_time",
+                    "quote_asset_volume",
+                    "trades",
+                    "taker_buy_base",
+                    "taker_buy_quote",
+                    "ignore",
+                ],
+            )
+            df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            df = df.dropna(subset=["close"])
+            if not df.empty:
+                _last_candle_errors.pop(f"{symbol}_{interval}", None)
+                return df
+            errors.append(f"{base_url}: empty_response")
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "sem status"
+            errors.append(f"{base_url}: HTTP {status}")
+        except requests.RequestException as exc:
+            errors.append(f"{base_url}: {exc}")
+        except Exception as exc:
+            errors.append(f"{base_url}: {exc}")
+
+    error_message = "; ".join(errors) if errors else "no_binance_endpoint_configured"
+    _last_candle_errors[f"{symbol}_{interval}"] = error_message
+    print(f"[ERRO] Candles {symbol} {interval}: {error_message}")
+    return None
 
 
 def calc_rsi(series: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
@@ -157,6 +173,7 @@ def scan_rsi_values() -> tuple[list[dict], list[dict]]:
                         "rsi": None,
                         "alert": False,
                         "error": "candles_unavailable",
+                        "details": _last_candle_errors.get(f"{symbol}_{tf_interval}"),
                     }
                 )
                 continue
@@ -375,6 +392,7 @@ def rsi_status():
                 "rsi_warning_limit": RSI_WARNING_LIMIT,
                 "rsi_extreme_limit": RSI_EXTREME_LIMIT,
                 "check_interval_min": CHECK_INTERVAL_MIN,
+                "binance_base_urls": BINANCE_BASE_URLS,
                 "symbols": SYMBOLS,
                 "timeframes": list(TIMEFRAMES.keys()),
             },

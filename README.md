@@ -41,7 +41,7 @@ Opcionais:
 | `RSI_WARNING_LIMIT` | `40` | Dispara alerta quando RSI fica abaixo deste valor |
 | `RSI_EXTREME_LIMIT` | `30` | Dispara alerta extremo separado quando RSI fica abaixo deste valor |
 | `CHECK_INTERVAL_MIN` | `15` | Intervalo entre verificacoes |
-| `BINANCE_BASE_URL` | `https://api.binance.com` | URL base da Binance |
+| `BINANCE_BASE_URLS` | `https://data-api.binance.vision,https://api1.binance.com,https://api.binance.com` | URLs da Binance para tentar em ordem |
 | `DISABLE_SCHEDULER` | vazio | Use `true` para desativar o agendador |
 
 ## Configurar Gmail
