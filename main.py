@@ -57,6 +57,27 @@ PLAN_MIN_WIN_RATE = float(os.getenv("PLAN_MIN_WIN_RATE", "60"))
 PLAN_MIN_PROFIT_FACTOR = float(os.getenv("PLAN_MIN_PROFIT_FACTOR", "1.25"))
 PLAN_MIN_AVG_ROI = float(os.getenv("PLAN_MIN_AVG_ROI", "0"))
 PLAN_MIN_SCORE = int(os.getenv("PLAN_MIN_SCORE", "60"))
+TRADE_COST_ROI_PCT = float(os.getenv("TRADE_COST_ROI_PCT", "1.2"))
+OPTIMIZE_TRADE_PARAMS = os.getenv("OPTIMIZE_TRADE_PARAMS", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+TP1_ROI_GRID = [
+    float(value)
+    for value in os.getenv("TP1_ROI_GRID", "20,30,40").split(",")
+    if value.strip()
+]
+TP2_ROI_GRID = [
+    float(value)
+    for value in os.getenv("TP2_ROI_GRID", "35,50,70").split(",")
+    if value.strip()
+]
+SL_ROI_GRID = [
+    float(value)
+    for value in os.getenv("SL_ROI_GRID", "8,12,18").split(",")
+    if value.strip()
+]
 SEND_ONLY_QUALIFIED_SIGNALS = os.getenv("SEND_ONLY_QUALIFIED_SIGNALS", "true").lower() in {
     "1",
     "true",
@@ -342,6 +363,7 @@ def build_trade_plan(
     tf_label: str,
     level_key: str,
     backtest_stats: dict | None = None,
+    params: dict | None = None,
 ) -> dict:
     """Gera um plano tecnico educacional, sem automatizar ordem."""
     close = float(df["close"].iloc[-1])
@@ -399,6 +421,14 @@ def build_trade_plan(
     sl_price_pct = min(max(support_sl_pct, atr_pct * 1.2, 1.0), 6.0)
     sl_roi_pct = sl_price_pct * LEVERAGE
 
+    if params:
+        tp1_roi_pct = params["tp1_roi_pct"]
+        tp2_roi_pct = params["tp2_roi_pct"]
+        sl_roi_pct = params["sl_roi_pct"]
+        tp1_price_pct = tp1_roi_pct / LEVERAGE
+        tp2_price_pct = tp2_roi_pct / LEVERAGE
+        sl_price_pct = sl_roi_pct / LEVERAGE
+
     tp1_price = entry_price * (1 + tp1_price_pct / 100)
     tp2_price = entry_price * (1 + tp2_price_pct / 100)
     sl_price = entry_price * (1 - sl_price_pct / 100)
@@ -437,6 +467,13 @@ def build_trade_plan(
         notes.append(
             f"ROI medio simulado: {pct_fmt(backtest_stats['avg_roi_pct'])}; payoff {backtest_stats['profit_factor']:.2f}"
         )
+        if backtest_stats.get("selected_params"):
+            notes.append(
+                "Parametros validados: "
+                f"TP1 {pct_fmt(backtest_stats['selected_params']['tp1_roi_pct'])}, "
+                f"TP2 {pct_fmt(backtest_stats['selected_params']['tp2_roi_pct'])}, "
+                f"SL {pct_fmt(backtest_stats['selected_params']['sl_roi_pct'])} em ROI"
+            )
     else:
         notes.append("Backtest local: amostra insuficiente para calibrar confianca")
 
@@ -477,7 +514,13 @@ def build_trade_plan(
     }
 
 
-def simulate_trade_outcome(df: pd.DataFrame, start_index: int, plan: dict, tf_label: str) -> dict:
+def simulate_trade_outcome(
+    df: pd.DataFrame,
+    start_index: int,
+    plan: dict,
+    tf_label: str,
+    apply_cost: bool = True,
+) -> dict:
     """Simula TP/SL apos um sinal historico. Se TP e SL baterem no mesmo candle, usa SL."""
     horizon = BACKTEST_LOOKAHEAD.get(tf_label, 16)
     future = df.iloc[start_index + 1 : start_index + 1 + horizon]
@@ -490,14 +533,19 @@ def simulate_trade_outcome(df: pd.DataFrame, start_index: int, plan: dict, tf_la
 
     for _, candle in future.iterrows():
         if float(candle["low"]) <= sl_price:
-            return {"outcome": "sl", "roi_pct": -plan["sl_roi_pct"]}
+            roi = -plan["sl_roi_pct"]
+            return {"outcome": "sl", "roi_pct": roi - TRADE_COST_ROI_PCT if apply_cost else roi}
         if float(candle["high"]) >= tp2_price:
-            return {"outcome": "tp2", "roi_pct": plan["tp2_roi_pct"]}
+            roi = plan["tp2_roi_pct"]
+            return {"outcome": "tp2", "roi_pct": roi - TRADE_COST_ROI_PCT if apply_cost else roi}
         if float(candle["high"]) >= tp1_price:
-            return {"outcome": "tp1", "roi_pct": plan["tp1_roi_pct"]}
+            roi = plan["tp1_roi_pct"]
+            return {"outcome": "tp1", "roi_pct": roi - TRADE_COST_ROI_PCT if apply_cost else roi}
 
     final_close = float(future["close"].iloc[-1])
     roi_pct = ((final_close - plan["entry_price"]) / plan["entry_price"]) * 100 * LEVERAGE
+    if apply_cost:
+        roi_pct -= TRADE_COST_ROI_PCT
     return {"outcome": "timeout", "roi_pct": roi_pct}
 
 
@@ -530,6 +578,91 @@ def summarize_trades(trades: list[dict]) -> dict:
     }
 
 
+def collect_signal_indexes(rsi_series: pd.Series, limit: float, start: int, end: int, cooldown: int) -> list[int]:
+    signal_indexes = []
+    last_signal_index = -cooldown
+    for index in range(start, end):
+        if index - last_signal_index < cooldown:
+            continue
+        if pd.notna(rsi_series.iloc[index]) and float(rsi_series.iloc[index]) < limit:
+            signal_indexes.append(index)
+            last_signal_index = index
+    return signal_indexes[-BACKTEST_MAX_SIGNALS:]
+
+
+def simulate_signals(
+    df: pd.DataFrame,
+    rsi_series: pd.Series,
+    signal_indexes: list[int],
+    tf_label: str,
+    level_key: str,
+    params: dict | None = None,
+) -> list[dict]:
+    trades = []
+    for index in signal_indexes:
+        historical_df = df.iloc[: index + 1]
+        historical_rsi = float(rsi_series.iloc[index])
+        plan = build_trade_plan(historical_df, historical_rsi, tf_label, level_key, params=params)
+        outcome = simulate_trade_outcome(df, index, plan, tf_label)
+        if outcome["outcome"] != "open":
+            trades.append(outcome)
+    return trades
+
+
+def candidate_param_grid(tf_label: str, level_key: str) -> list[dict]:
+    priority = TIMEFRAME_PRIORITY.get(tf_label, 1)
+    extreme_bonus = 8 if level_key == "extreme" else 0
+    candidates = []
+    for tp1 in TP1_ROI_GRID:
+        for tp2 in TP2_ROI_GRID:
+            for sl in SL_ROI_GRID:
+                tp1_adj = tp1 + ((priority - 1) * 5) + extreme_bonus
+                tp2_adj = tp2 + ((priority - 1) * 8) + extreme_bonus
+                if tp2_adj <= tp1_adj:
+                    continue
+                candidates.append(
+                    {
+                        "tp1_roi_pct": tp1_adj,
+                        "tp2_roi_pct": tp2_adj,
+                        "sl_roi_pct": sl,
+                    }
+                )
+    return candidates
+
+
+def select_params_by_train(
+    df: pd.DataFrame,
+    rsi_series: pd.Series,
+    train_indexes: list[int],
+    tf_label: str,
+    level_key: str,
+) -> tuple[dict | None, dict]:
+    if not OPTIMIZE_TRADE_PARAMS or not train_indexes:
+        return None, summarize_trades(simulate_signals(df, rsi_series, train_indexes, tf_label, level_key))
+
+    best_params = None
+    best_stats = summarize_trades([])
+    best_score = -10**9
+
+    for params in candidate_param_grid(tf_label, level_key):
+        trades = simulate_signals(df, rsi_series, train_indexes, tf_label, level_key, params)
+        stats = summarize_trades(trades)
+        if stats["sample_size"] < max(3, BACKTEST_MIN_TRADES // 2):
+            continue
+        score = (
+            (stats["win_rate_pct"] * 0.45)
+            + (stats["avg_roi_pct"] * 0.8)
+            + (min(stats["profit_factor"], 3) * 6)
+            - (params["sl_roi_pct"] * 0.15)
+        )
+        if score > best_score:
+            best_score = score
+            best_params = params
+            best_stats = stats
+
+    return best_params, best_stats
+
+
 def evaluate_backtest(df: pd.DataFrame, rsi_series: pd.Series, tf_label: str, level_key: str) -> dict:
     """Backtest walk-forward com validacao fora da amostra."""
     limit = RSI_EXTREME_LIMIT if level_key == "extreme" else RSI_WARNING_LIMIT
@@ -541,34 +674,35 @@ def evaluate_backtest(df: pd.DataFrame, rsi_series: pd.Series, tf_label: str, le
     if end <= start:
         return summarize_trades([])
 
-    signal_indexes = []
-    last_signal_index = -cooldown
-    for index in range(start, end):
-        if index - last_signal_index < cooldown:
-            continue
-        if pd.notna(rsi_series.iloc[index]) and float(rsi_series.iloc[index]) < limit:
-            signal_indexes.append(index)
-            last_signal_index = index
+    signal_indexes = collect_signal_indexes(rsi_series, limit, start, end, cooldown)
+    if not signal_indexes:
+        return summarize_trades([])
 
-    signal_indexes = signal_indexes[-BACKTEST_MAX_SIGNALS:]
+    validation_size = max(BACKTEST_MIN_TRADES, round(len(signal_indexes) * BACKTEST_VALIDATION_RATIO))
+    validation_size = min(validation_size, len(signal_indexes))
+    train_indexes = signal_indexes[: len(signal_indexes) - validation_size]
+    validation_indexes = signal_indexes[len(signal_indexes) - validation_size :]
 
-    trades = []
-    for index in signal_indexes:
-        historical_df = df.iloc[: index + 1]
-        historical_rsi = float(rsi_series.iloc[index])
-        plan = build_trade_plan(historical_df, historical_rsi, tf_label, level_key)
-        outcome = simulate_trade_outcome(df, index, plan, tf_label)
-        if outcome["outcome"] != "open":
-            trades.append(outcome)
+    selected_params, train_stats = select_params_by_train(
+        df,
+        rsi_series,
+        train_indexes,
+        tf_label,
+        level_key,
+    )
+    train_trades = simulate_signals(df, rsi_series, train_indexes, tf_label, level_key, selected_params)
+    validation_trades = simulate_signals(
+        df,
+        rsi_series,
+        validation_indexes,
+        tf_label,
+        level_key,
+        selected_params,
+    )
+    all_trades = train_trades + validation_trades
 
-    validation_size = max(BACKTEST_MIN_TRADES, round(len(trades) * BACKTEST_VALIDATION_RATIO))
-    validation_size = min(validation_size, len(trades))
-    train_trades = trades[: len(trades) - validation_size]
-    validation_trades = trades[len(trades) - validation_size :]
-
-    train_stats = summarize_trades(train_trades)
     validation_stats = summarize_trades(validation_trades)
-    all_stats = summarize_trades(trades)
+    all_stats = summarize_trades(all_trades)
     overfit_gap = round(train_stats["win_rate_pct"] - validation_stats["win_rate_pct"], 2)
     overfit_warning = (
         train_stats["sample_size"] >= BACKTEST_MIN_TRADES
@@ -582,6 +716,9 @@ def evaluate_backtest(df: pd.DataFrame, rsi_series: pd.Series, tf_label: str, le
             "all_stats": all_stats,
             "validation_ratio": BACKTEST_VALIDATION_RATIO,
             "cooldown_candles": cooldown,
+            "trade_cost_roi_pct": TRADE_COST_ROI_PCT,
+            "optimized_params": bool(selected_params),
+            "selected_params": selected_params,
             "overfit_gap_pct": overfit_gap,
             "overfit_warning": overfit_warning,
         }
@@ -807,6 +944,11 @@ def build_model_report() -> dict:
             "plan_min_profit_factor": PLAN_MIN_PROFIT_FACTOR,
             "plan_min_avg_roi": PLAN_MIN_AVG_ROI,
             "plan_min_score": PLAN_MIN_SCORE,
+            "trade_cost_roi_pct": TRADE_COST_ROI_PCT,
+            "optimize_trade_params": OPTIMIZE_TRADE_PARAMS,
+            "tp1_roi_grid": TP1_ROI_GRID,
+            "tp2_roi_grid": TP2_ROI_GRID,
+            "sl_roi_grid": SL_ROI_GRID,
         },
     }
 
@@ -884,7 +1026,8 @@ def scan_one_rsi(symbol: str, tf_label: str, tf_interval: str, now_slot: str) ->
     triggered_levels = [level for level in ALERT_LEVELS if value < level["limit"]]
     plan_level = "extreme" if any(level["key"] == "extreme" for level in triggered_levels) else "warning"
     backtest_stats = get_strategy_stats(symbol, tf_label, plan_level) if triggered_levels else None
-    plan = build_trade_plan(df, value, tf_label, plan_level, backtest_stats)
+    plan_params = backtest_stats.get("selected_params") if backtest_stats else None
+    plan = build_trade_plan(df, value, tf_label, plan_level, backtest_stats, params=plan_params)
     item = {
         "symbol": symbol,
         "tf": tf_label,
@@ -1287,6 +1430,11 @@ def rsi_status():
                 "plan_min_profit_factor": PLAN_MIN_PROFIT_FACTOR,
                 "plan_min_avg_roi": PLAN_MIN_AVG_ROI,
                 "plan_min_score": PLAN_MIN_SCORE,
+                "trade_cost_roi_pct": TRADE_COST_ROI_PCT,
+                "optimize_trade_params": OPTIMIZE_TRADE_PARAMS,
+                "tp1_roi_grid": TP1_ROI_GRID,
+                "tp2_roi_grid": TP2_ROI_GRID,
+                "sl_roi_grid": SL_ROI_GRID,
                 "send_only_qualified_signals": SEND_ONLY_QUALIFIED_SIGNALS,
                 "display_timezone": DISPLAY_TIMEZONE,
                 "binance_base_urls": BINANCE_BASE_URLS,
