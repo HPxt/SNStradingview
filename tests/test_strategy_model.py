@@ -152,6 +152,28 @@ class StrategyModelTests(unittest.TestCase):
             plan["first_entry_price"] * (1 - 18 / 100),
         )
 
+    def test_btc_dominance_falling_favors_alts(self):
+        history = [{"value": value} for value in [55.0, 54.9, 54.8, 54.7, 54.55, 54.3]]
+        analysis = main.analyze_btc_dominance(history)
+
+        self.assertTrue(analysis["passed"])
+        self.assertTrue(analysis["falling"])
+        self.assertGreaterEqual(analysis["score"], 75)
+
+    def test_btc_dominance_bouncing_support_rejects_alts(self):
+        history = [{"value": value} for value in [54.2, 54.0, 53.9, 53.95, 54.18, 54.5]]
+        analysis = main.analyze_btc_dominance(history)
+
+        self.assertFalse(analysis["passed"])
+        self.assertTrue(analysis["rising"])
+        self.assertLessEqual(analysis["score"], 35)
+
+    def test_btc_dominance_is_neutral_without_symbol_to_avoid_backtest_bias(self):
+        filter_result = main.btc_dominance_filter(None)
+
+        self.assertTrue(filter_result["passed"])
+        self.assertIn("backtest", filter_result["detail"])
+
     def test_plan_must_be_qualified_to_send(self):
         sendable, reason = main.is_plan_sendable(
             {

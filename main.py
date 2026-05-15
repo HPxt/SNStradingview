@@ -116,6 +116,15 @@ BINANCE_BASE_URLS = [
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "2.5"))
 SCAN_MAX_WORKERS = int(os.getenv("SCAN_MAX_WORKERS", "8"))
 CANDLE_LIMIT = max(RSI_PERIOD + 220, 250)
+BTC_DOMINANCE_ENABLED = os.getenv("BTC_DOMINANCE_ENABLED", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+BTC_DOMINANCE_URL = os.getenv("BTC_DOMINANCE_URL", "https://api.coingecko.com/api/v3/global")
+BTC_DOMINANCE_HISTORY_LIMIT = int(os.getenv("BTC_DOMINANCE_HISTORY_LIMIT", "96"))
+BTC_DOMINANCE_MIN_SAMPLES = int(os.getenv("BTC_DOMINANCE_MIN_SAMPLES", "6"))
+BTC_DOMINANCE_TREND_THRESHOLD = float(os.getenv("BTC_DOMINANCE_TREND_THRESHOLD", "0.15"))
 
 # Controle para nao enviar e-mail duplicado na mesma janela.
 _alerted = set()
@@ -136,6 +145,19 @@ _strategy_model = {
     "history": [],
 }
 _market_context = {}
+_dominance_lock = threading.Lock()
+_dominance_context = {
+    "last_updated_utc": None,
+    "history": [],
+    "analysis": {
+        "enabled": BTC_DOMINANCE_ENABLED,
+        "status": "warming_up",
+        "passed": True,
+        "score": 50,
+        "reason": "BTC.D ainda sem historico suficiente",
+    },
+    "error": None,
+}
 
 ALERT_LEVELS = [
     {
@@ -320,6 +342,178 @@ def calc_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False, min_periods=period).mean()
 
 
+def fetch_btc_dominance() -> float | None:
+    """Busca BTC Dominance atual. CoinGecko retorna percentual de market cap."""
+    if not BTC_DOMINANCE_ENABLED:
+        return None
+
+    try:
+        response = requests.get(BTC_DOMINANCE_URL, timeout=HTTP_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        payload = response.json()
+        value = payload.get("data", {}).get("market_cap_percentage", {}).get("btc")
+        if value is None:
+            raise ValueError("btc dominance ausente na resposta")
+        return float(value)
+    except Exception as exc:
+        with _dominance_lock:
+            _dominance_context["error"] = str(exc)
+            _dominance_context["analysis"] = {
+                "enabled": BTC_DOMINANCE_ENABLED,
+                "status": "unavailable",
+                "passed": True,
+                "score": 50,
+                "reason": f"BTC.D indisponivel: {exc}",
+            }
+        print(f"[ERRO] BTC.D: {exc}")
+        return None
+
+
+def analyze_btc_dominance(history: list[dict]) -> dict:
+    clean = [
+        {"time": item.get("time"), "value": float(item["value"])}
+        for item in history
+        if item.get("value") is not None
+    ]
+    if not BTC_DOMINANCE_ENABLED:
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "passed": True,
+            "score": 50,
+            "reason": "BTC.D desativada",
+        }
+
+    if len(clean) < BTC_DOMINANCE_MIN_SAMPLES:
+        return {
+            "enabled": True,
+            "status": "warming_up",
+            "passed": True,
+            "score": 50,
+            "samples": len(clean),
+            "required_samples": BTC_DOMINANCE_MIN_SAMPLES,
+            "reason": "BTC.D ainda sem historico suficiente",
+        }
+
+    values = [item["value"] for item in clean]
+    current = values[-1]
+    lookback = min(24, len(values) - 1)
+    previous = values[-1 - lookback]
+    trend_delta = current - previous
+    recent = values[-lookback - 1 :]
+    support = min(recent)
+    resistance = max(recent)
+    avg = sum(recent) / len(recent)
+    near_support = current <= support + BTC_DOMINANCE_TREND_THRESHOLD
+    near_resistance = current >= resistance - BTC_DOMINANCE_TREND_THRESHOLD
+    falling = trend_delta <= -BTC_DOMINANCE_TREND_THRESHOLD
+    rising = trend_delta >= BTC_DOMINANCE_TREND_THRESHOLD
+    rejecting_resistance = near_resistance and falling
+    bouncing_support = near_support and rising
+    favorable_for_alts = falling or rejecting_resistance
+    unfavorable_for_alts = rising and (bouncing_support or current >= avg)
+
+    if favorable_for_alts:
+        score = 85 if rejecting_resistance else 75
+        reason = "BTC.D caindo, favorece fluxo para altcoins"
+        if rejecting_resistance:
+            reason = "BTC.D rejeitando resistencia, favorece altcoins"
+    elif unfavorable_for_alts:
+        score = 25 if bouncing_support else 35
+        reason = "BTC.D subindo, pressiona altcoins"
+        if bouncing_support:
+            reason = "BTC.D reagindo em suporte, risco para altcoins"
+    else:
+        score = 55
+        reason = "BTC.D neutra/lateral"
+
+    return {
+        "enabled": True,
+        "status": "ready",
+        "passed": not unfavorable_for_alts,
+        "score": score,
+        "current": round(current, 3),
+        "previous": round(previous, 3),
+        "trend_delta": round(trend_delta, 3),
+        "support": round(support, 3),
+        "resistance": round(resistance, 3),
+        "average": round(avg, 3),
+        "near_support": near_support,
+        "near_resistance": near_resistance,
+        "falling": falling,
+        "rising": rising,
+        "rejecting_resistance": rejecting_resistance,
+        "bouncing_support": bouncing_support,
+        "samples": len(clean),
+        "reason": reason,
+    }
+
+
+def update_btc_dominance_context() -> dict:
+    if not BTC_DOMINANCE_ENABLED:
+        return _dominance_context["analysis"]
+
+    value = fetch_btc_dominance()
+    if value is None:
+        return _dominance_context["analysis"]
+
+    with _dominance_lock:
+        history = _dominance_context["history"]
+        history.append({"time": utc_now().isoformat(), "value": value})
+        del history[:-BTC_DOMINANCE_HISTORY_LIMIT]
+        analysis = analyze_btc_dominance(history)
+        _dominance_context["last_updated_utc"] = utc_now().isoformat()
+        _dominance_context["analysis"] = analysis
+        _dominance_context["error"] = None
+        return analysis
+
+
+def get_btc_dominance_analysis() -> dict:
+    with _dominance_lock:
+        return dict(_dominance_context["analysis"])
+
+
+def btc_dominance_filter(symbol: str | None) -> dict:
+    analysis = get_btc_dominance_analysis()
+    if symbol is None:
+        return {
+            "name": "BTC.D fluxo para alts",
+            "passed": True,
+            "weight": 12,
+            "detail": "neutro no backtest historico",
+            "analysis": analysis,
+        }
+
+    if symbol == "BTCUSDT":
+        return {
+            "name": "BTC.D",
+            "passed": True,
+            "weight": 12,
+            "detail": "neutro para BTC",
+            "analysis": analysis,
+        }
+
+    if analysis.get("status") != "ready":
+        return {
+            "name": "BTC.D fluxo para alts",
+            "passed": True,
+            "weight": 12,
+            "detail": analysis.get("reason", "BTC.D neutra"),
+            "analysis": analysis,
+        }
+
+    return {
+        "name": "BTC.D fluxo para alts",
+        "passed": bool(analysis.get("passed", True)),
+        "weight": 12,
+        "detail": (
+            f"{analysis.get('reason')}; atual {analysis.get('current')}%, "
+            f"delta {analysis.get('trend_delta')}pp"
+        ),
+        "analysis": analysis,
+    }
+
+
 def calc_context_score(
     df: pd.DataFrame,
     rsi_series: pd.Series,
@@ -425,6 +619,7 @@ def calc_context_score(
             "weight": 14,
             "detail": "ok" if market_ok else "BTC contexto fraco",
         },
+        btc_dominance_filter(symbol),
     ]
 
     passed = [item for item in filters if item["passed"]]
@@ -441,6 +636,7 @@ def calc_context_score(
         "atr_pct": round(atr_pct, 2),
         "range_position": round(range_position, 3),
         "market_ok": market_ok,
+        "btc_dominance": get_btc_dominance_analysis(),
     }
 
 
@@ -1418,6 +1614,7 @@ def scan_one_rsi(symbol: str, tf_label: str, tf_interval: str, now_slot: str) ->
 def scan_rsi_values() -> tuple[list[dict], list[dict]]:
     """Calcula todos os RSI em paralelo e retorna valores atuais e alertas pendentes."""
     now_slot = utc_now().strftime("%Y-%m-%d %H")
+    update_btc_dominance_context()
     values = []
     alerts = []
     jobs = [
@@ -1718,6 +1915,7 @@ def home():
         f"<p>Timeframes: {', '.join(TIMEFRAMES.keys())}</p>"
         f"<p>Alertas quando RSI &lt; {RSI_WARNING_LIMIT:g} e RSI &lt; {RSI_EXTREME_LIMIT:g}</p>"
         f"<p>E-mail apenas quando call qualificada: {SEND_ONLY_QUALIFIED_SIGNALS}</p>"
+        f"<p>BTC.D: {html.escape(get_btc_dominance_analysis().get('reason', 'sem leitura'))}</p>"
         f"<p>Horario atual: {format_display_time()}</p>"
     ), 200
 
@@ -1781,6 +1979,9 @@ def rsi_status():
                 "check_interval_min": CHECK_INTERVAL_MIN,
                 "http_timeout_seconds": HTTP_TIMEOUT_SECONDS,
                 "scan_max_workers": SCAN_MAX_WORKERS,
+                "btc_dominance_enabled": BTC_DOMINANCE_ENABLED,
+                "btc_dominance_min_samples": BTC_DOMINANCE_MIN_SAMPLES,
+                "btc_dominance_trend_threshold": BTC_DOMINANCE_TREND_THRESHOLD,
                 "leverage": LEVERAGE,
                 "backtest_min_trades": BACKTEST_MIN_TRADES,
                 "backtest_max_signals": BACKTEST_MAX_SIGNALS,
@@ -1815,6 +2016,12 @@ def rsi_status():
             "email_provider": "resend" if RESEND_API_KEY else "gmail_smtp",
             "resend_from": RESEND_FROM if RESEND_API_KEY else None,
             "last_email_results": _last_email_results,
+            "btc_dominance": {
+                "last_updated_utc": _dominance_context["last_updated_utc"],
+                "history_count": len(_dominance_context["history"]),
+                "error": _dominance_context["error"],
+                "analysis": _dominance_context["analysis"],
+            },
             "scan_running": _scan_lock.locked(),
             "strategy_model": {
                 "trained_at_utc": _strategy_model["trained_at_utc"],

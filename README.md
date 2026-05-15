@@ -51,6 +51,9 @@ Opcionais:
 | `RSI_RECOVERY_LOOKBACK` | `6` | Candles usados para confirmar que o RSI parou de cair |
 | `RSI_RECOVERY_BUFFER` | `2` | Recuperacao minima do RSI a partir do fundo recente |
 | `CHECK_INTERVAL_MIN` | `15` | Intervalo entre verificacoes |
+| `BTC_DOMINANCE_ENABLED` | `true` | Usa BTC Dominance como filtro de fluxo para altcoins |
+| `BTC_DOMINANCE_MIN_SAMPLES` | `6` | Leituras minimas antes da BTC.D afetar o score |
+| `BTC_DOMINANCE_TREND_THRESHOLD` | `0.15` | Delta minimo em pontos percentuais para considerar alta/queda |
 | `LEVERAGE` | `10` | Alavancagem usada apenas para estimar TP/SL no alerta |
 | `BACKTEST_MIN_TRADES` | `20` | Amostra minima para calibrar confianca pelo backtest |
 | `BACKTEST_MAX_SIGNALS` | `80` | Maximo de sinais historicos avaliados por par/timeframe |
@@ -79,7 +82,7 @@ Opcionais:
 | `BINANCE_BASE_URLS` | `https://data-api.binance.vision,https://api1.binance.com,https://api.binance.com` | URLs da Binance para tentar em ordem |
 | `DISABLE_SCHEDULER` | vazio | Use `true` para desativar o agendador |
 
-Os planos de entrada/TP/SL enviados por e-mail sao educativos e baseados em indicadores tecnicos. Por padrao, o app so envia e-mail quando a call completa passa os filtros minimos de assertividade, ROI, payoff, score, confianca e confirmacao de recuperacao do RSI. A entrada dividida tambem entra no backtest: primeira parte no preco atual e segunda parte apenas se o preco cair o equivalente ao ROI escolhido pelo treino. BTC usa uma grade mais curta; altcoins usam uma grade mais larga por terem volatilidade maior. Candidatos recusados podem ser vistos em `/rsi`, mas nao viram e-mail. O relatorio `/model-report` mostra a quantidade de dados por timeframe, o que passou e o que foi recusado. O historico `/model-history` mostra a evolucao da nota geral de 0 a 100 e das notas por componente. Eles nao executam ordens e nao substituem gestao de risco.
+Os planos de entrada/TP/SL enviados por e-mail sao educativos e baseados em indicadores tecnicos. Por padrao, o app so envia e-mail quando a call completa passa os filtros minimos de assertividade, ROI, payoff, score, confianca e confirmacao de recuperacao do RSI. Para altcoins, o contexto tambem acompanha BTC Dominance: queda ou rejeicao em resistencia favorece alts; alta ou reacao em suporte penaliza o score. A entrada dividida tambem entra no backtest: primeira parte no preco atual e segunda parte apenas se o preco cair o equivalente ao ROI escolhido pelo treino. BTC usa uma grade mais curta; altcoins usam uma grade mais larga por terem volatilidade maior. Candidatos recusados podem ser vistos em `/rsi`, mas nao viram e-mail. O relatorio `/model-report` mostra a quantidade de dados por timeframe, o que passou e o que foi recusado. O historico `/model-history` mostra a evolucao da nota geral de 0 a 100 e das notas por componente. Eles nao executam ordens e nao substituem gestao de risco.
 
 ## Configurar Gmail
 
