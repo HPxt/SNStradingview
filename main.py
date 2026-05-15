@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -22,6 +23,8 @@ EMAIL_TO = os.getenv("EMAIL_TO", "destino@gmail.com")
 GMAIL_PASS = os.getenv("GMAIL_PASS", "sua_app_password")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_FROM = os.getenv("RESEND_FROM", "RSI Monitor <onboarding@resend.dev>")
+DISPLAY_TIMEZONE = os.getenv("DISPLAY_TIMEZONE", "America/Sao_Paulo")
+DISPLAY_TZ = ZoneInfo(DISPLAY_TIMEZONE)
 
 SYMBOLS = [
     "JTOUSDT",
@@ -89,6 +92,14 @@ ALERT_LEVELS = [
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def display_now() -> datetime:
+    return utc_now().astimezone(DISPLAY_TZ)
+
+
+def format_display_time() -> str:
+    return f"{display_now().strftime('%d/%m/%Y %H:%M')} {DISPLAY_TIMEZONE}"
 
 
 def get_candles(symbol: str, interval: str, limit: int = CANDLE_LIMIT) -> pd.DataFrame | None:
@@ -364,7 +375,7 @@ def build_email_html(alerts: list[dict], alert_level: dict) -> str:
       <div style="max-width:640px;margin:auto;background:white;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.1)">
         <div style="background:#1a1a2e;color:white;padding:20px 24px">
           <h2 style="margin:0">{alert_level['title'].format(limit=alert_level['limit'])}</h2>
-          <p style="margin:4px 0 0;opacity:.8;font-size:13px">{utc_now().strftime('%d/%m/%Y %H:%M')} UTC</p>
+          <p style="margin:4px 0 0;opacity:.8;font-size:13px">{format_display_time()}</p>
         </div>
         <div style="padding:20px">
           <table style="width:100%;border-collapse:collapse">
@@ -473,7 +484,7 @@ def home():
         f"<p>Pares: {', '.join(SYMBOLS)}</p>"
         f"<p>Timeframes: {', '.join(TIMEFRAMES.keys())}</p>"
         f"<p>Alertas quando RSI &lt; {RSI_WARNING_LIMIT:g} e RSI &lt; {RSI_EXTREME_LIMIT:g}</p>"
-        f"<p>Horario atual: {utc_now().strftime('%d/%m/%Y %H:%M')} UTC</p>"
+        f"<p>Horario atual: {format_display_time()}</p>"
     ), 200
 
 
@@ -500,6 +511,7 @@ def rsi_status():
         {
             "checked_at_utc": _last_scan["checked_at_utc"],
             "served_at_utc": utc_now().isoformat(),
+            "served_at_local": display_now().isoformat(),
             "config": {
                 "rsi_period": RSI_PERIOD,
                 "rsi_warning_limit": RSI_WARNING_LIMIT,
@@ -507,6 +519,7 @@ def rsi_status():
                 "check_interval_min": CHECK_INTERVAL_MIN,
                 "http_timeout_seconds": HTTP_TIMEOUT_SECONDS,
                 "scan_max_workers": SCAN_MAX_WORKERS,
+                "display_timezone": DISPLAY_TIMEZONE,
                 "binance_base_urls": BINANCE_BASE_URLS,
                 "symbols": SYMBOLS,
                 "timeframes": list(TIMEFRAMES.keys()),
