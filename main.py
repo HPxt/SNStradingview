@@ -1,6 +1,7 @@
 import html
 import os
 import smtplib
+import threading
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -47,13 +48,20 @@ BINANCE_BASE_URLS = [
     ).split(",")
     if url.strip()
 ]
-HTTP_TIMEOUT_SECONDS = 10
+HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "4"))
 CANDLE_LIMIT = max(RSI_PERIOD + 50, 100)
 
 # Controle para nao enviar e-mail duplicado na mesma janela.
 _alerted = set()
 _scheduler: BackgroundScheduler | None = None
 _last_candle_errors = {}
+_scan_lock = threading.Lock()
+_last_scan = {
+    "checked_at_utc": None,
+    "values": [],
+    "pending_alerts": [],
+}
+_last_email_results = []
 
 ALERT_LEVELS = [
     {
@@ -228,6 +236,30 @@ def scan_rsi_values() -> tuple[list[dict], list[dict]]:
     return values, alerts
 
 
+def scan_rsi_values_locked(force: bool = False) -> tuple[list[dict], list[dict], bool]:
+    """Executa um scan por vez e guarda o ultimo resultado para diagnostico rapido."""
+    if not _scan_lock.acquire(blocking=False):
+        return _last_scan["values"], _last_scan["pending_alerts"], False
+
+    try:
+        values, alerts = scan_rsi_values()
+        _last_scan["checked_at_utc"] = utc_now().isoformat()
+        _last_scan["values"] = values
+        _last_scan["pending_alerts"] = [
+            {
+                "symbol": alert["symbol"],
+                "tf": alert["tf"],
+                "rsi": round(alert["rsi"], 2),
+                "level": alert["level"],
+                "limit": alert["limit"],
+            }
+            for alert in alerts
+        ]
+        return values, alerts, True
+    finally:
+        _scan_lock.release()
+
+
 def send_email(subject: str, body_html: str) -> bool:
     """Envia e-mail via Gmail SMTP."""
     if not EMAIL_FROM or not EMAIL_TO or not GMAIL_PASS:
@@ -296,15 +328,18 @@ def build_email_html(alerts: list[dict], alert_level: dict) -> str:
 
 def check_rsi() -> list[dict]:
     """Verifica o RSI de todos os pares e timeframes."""
-    global _alerted
+    global _alerted, _last_email_results
 
     now = utc_now()
     now_slot = now.strftime("%Y-%m-%d %H")
     alerts = []
 
     print(f"\n[{now.strftime('%d/%m %H:%M')}] Verificando RSI...")
+    _last_email_results = []
 
-    values, alerts = scan_rsi_values()
+    values, alerts, executed = scan_rsi_values_locked(force=True)
+    if not executed:
+        print("  Scan ja em andamento; usando ultimo resultado em cache.")
     for item in values:
         if item["rsi"] is None:
             print(f"  {item['symbol']} {item['tf']}: {item['error']}")
@@ -324,7 +359,16 @@ def check_rsi() -> list[dict]:
 
             pairs = ", ".join(sorted({alert["symbol"] for alert in level_alerts}))
             subject = f"{alert_level['subject'].format(limit=alert_level['limit'])} - {pairs}"
-            if send_email(subject, build_email_html(level_alerts, alert_level)):
+            sent = send_email(subject, build_email_html(level_alerts, alert_level))
+            _last_email_results.append(
+                {
+                    "level": alert_level["key"],
+                    "subject": subject,
+                    "alerts": len(level_alerts),
+                    "sent": sent,
+                }
+            )
+            if sent:
                 _alerted.update(alert["key"] for alert in level_alerts)
             else:
                 print(
@@ -377,37 +421,40 @@ def home():
 def force_check():
     """Rota para disparar verificacao manual."""
     alerts = check_rsi()
-    return f"Verificacao executada. Alertas encontrados: {len(alerts)}.", 200
+    if _last_email_results:
+        sent = sum(1 for result in _last_email_results if result["sent"])
+        failed = sum(1 for result in _last_email_results if not result["sent"])
+        return (
+            f"Verificacao executada. Alertas encontrados: {len(alerts)}. "
+            f"E-mails enviados: {sent}. Falhas de e-mail: {failed}.",
+            200,
+        )
+
+    return f"Verificacao executada. Alertas encontrados: {len(alerts)}. Nenhum e-mail pendente.", 200
 
 
 @app.route("/rsi")
 def rsi_status():
-    """Mostra os RSI que o app esta calculando agora."""
-    values, alerts = scan_rsi_values()
+    """Mostra os RSI que o app calculou por ultimo, sem travar em consultas externas."""
     return jsonify(
         {
-            "checked_at_utc": utc_now().isoformat(),
+            "checked_at_utc": _last_scan["checked_at_utc"],
+            "served_at_utc": utc_now().isoformat(),
             "config": {
                 "rsi_period": RSI_PERIOD,
                 "rsi_warning_limit": RSI_WARNING_LIMIT,
                 "rsi_extreme_limit": RSI_EXTREME_LIMIT,
                 "check_interval_min": CHECK_INTERVAL_MIN,
+                "http_timeout_seconds": HTTP_TIMEOUT_SECONDS,
                 "binance_base_urls": BINANCE_BASE_URLS,
                 "symbols": SYMBOLS,
                 "timeframes": list(TIMEFRAMES.keys()),
             },
             "email_configured": bool(EMAIL_FROM and EMAIL_TO and GMAIL_PASS),
-            "pending_alerts": [
-                {
-                    "symbol": alert["symbol"],
-                    "tf": alert["tf"],
-                    "rsi": round(alert["rsi"], 2),
-                    "level": alert["level"],
-                    "limit": alert["limit"],
-                }
-                for alert in alerts
-            ],
-            "values": values,
+            "last_email_results": _last_email_results,
+            "scan_running": _scan_lock.locked(),
+            "pending_alerts": _last_scan["pending_alerts"],
+            "values": _last_scan["values"],
         }
     )
 
