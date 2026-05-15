@@ -24,7 +24,15 @@ rsi_alertas/
 
 ## Variaveis de ambiente
 
-Obrigatorias para envio de e-mail:
+Para envio no Render Free, prefira Resend via HTTPS:
+
+| Key | Exemplo |
+| --- | --- |
+| `RESEND_API_KEY` | `re_xxxxxxxxx` |
+| `RESEND_FROM` | `RSI Monitor <onboarding@resend.dev>` |
+| `EMAIL_TO` | `hppeixoto14@gmail.com` |
+
+O Gmail SMTP pode funcionar localmente, mas o Render Free bloqueia trafego SMTP. Variaveis para uso local ou instancia paga:
 
 | Key | Exemplo |
 | --- | --- |

@@ -20,6 +20,8 @@ app = Flask(__name__)
 EMAIL_FROM = os.getenv("EMAIL_FROM", "seuemail@gmail.com")
 EMAIL_TO = os.getenv("EMAIL_TO", "destino@gmail.com")
 GMAIL_PASS = os.getenv("GMAIL_PASS", "sua_app_password")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+RESEND_FROM = os.getenv("RESEND_FROM", "RSI Monitor <onboarding@resend.dev>")
 
 SYMBOLS = [
     "JTOUSDT",
@@ -278,7 +280,39 @@ def scan_rsi_values_locked(force: bool = False) -> tuple[list[dict], list[dict],
         _scan_lock.release()
 
 
-def send_email(subject: str, body_html: str) -> bool:
+def send_email_via_resend(subject: str, body_html: str) -> bool:
+    """Envia e-mail pela API HTTPS do Resend."""
+    if not RESEND_API_KEY or not EMAIL_TO:
+        print("[ERRO] Resend: configure RESEND_API_KEY e EMAIL_TO.")
+        return False
+
+    try:
+        response = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": RESEND_FROM,
+                "to": [EMAIL_TO],
+                "subject": subject,
+                "html": body_html,
+            },
+            timeout=HTTP_TIMEOUT_SECONDS,
+        )
+        if response.status_code >= 400:
+            print(f"[ERRO] Resend: HTTP {response.status_code} - {response.text}")
+            return False
+
+        print(f"[EMAIL] Enviado via Resend: {subject}")
+        return True
+    except Exception as exc:
+        print(f"[ERRO] Resend: {exc}")
+        return False
+
+
+def send_email_via_gmail(subject: str, body_html: str) -> bool:
     """Envia e-mail via Gmail SMTP."""
     if not EMAIL_FROM or not EMAIL_TO or not GMAIL_PASS:
         print("[ERRO] E-mail: configure EMAIL_FROM, EMAIL_TO e GMAIL_PASS.")
@@ -300,6 +334,14 @@ def send_email(subject: str, body_html: str) -> bool:
     except Exception as exc:
         print(f"[ERRO] E-mail: {exc}")
         return False
+
+
+def send_email(subject: str, body_html: str) -> bool:
+    """Envia e-mail pelo provedor configurado."""
+    if RESEND_API_KEY:
+        return send_email_via_resend(subject, body_html)
+
+    return send_email_via_gmail(subject, body_html)
 
 
 def build_email_html(alerts: list[dict], alert_level: dict) -> str:
@@ -470,6 +512,8 @@ def rsi_status():
                 "timeframes": list(TIMEFRAMES.keys()),
             },
             "email_configured": bool(EMAIL_FROM and EMAIL_TO and GMAIL_PASS),
+            "email_provider": "resend" if RESEND_API_KEY else "gmail_smtp",
+            "resend_from": RESEND_FROM if RESEND_API_KEY else None,
             "last_email_results": _last_email_results,
             "scan_running": _scan_lock.locked(),
             "pending_alerts": _last_scan["pending_alerts"],
