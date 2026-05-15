@@ -18,7 +18,8 @@ rsi_alertas/
 - Usa a API publica da Binance Spot, entao nao precisa de API key para buscar candles.
 - Calcula RSI de 14 periodos usando suavizacao estilo Wilder.
 - Verifica os timeframes a cada 15 minutos.
-- Evita e-mail duplicado para o mesmo par/timeframe dentro da mesma hora.
+- Envia alertas separados para RSI abaixo de 40 e RSI abaixo de 30.
+- Evita e-mail duplicado para o mesmo par/timeframe/nivel dentro da mesma hora.
 - Expoe `/` como health check, `/check` para rodar uma verificacao manual e `/rsi` para diagnosticar os valores atuais.
 
 ## Variaveis de ambiente
@@ -36,7 +37,9 @@ Opcionais:
 | Key | Padrao | Descricao |
 | --- | --- | --- |
 | `RSI_PERIOD` | `14` | Periodo do RSI |
-| `RSI_LIMIT` | `40` | Dispara alerta quando RSI fica abaixo deste valor |
+| `RSI_LIMIT` | `40` | Compatibilidade: limite do alerta principal |
+| `RSI_WARNING_LIMIT` | `40` | Dispara alerta quando RSI fica abaixo deste valor |
+| `RSI_EXTREME_LIMIT` | `30` | Dispara alerta extremo separado quando RSI fica abaixo deste valor |
 | `CHECK_INTERVAL_MIN` | `15` | Intervalo entre verificacoes |
 | `BINANCE_BASE_URL` | `https://api.binance.com` | URL base da Binance |
 | `DISABLE_SCHEDULER` | vazio | Use `true` para desativar o agendador |

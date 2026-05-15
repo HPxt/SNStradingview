@@ -35,7 +35,8 @@ TIMEFRAMES = {
 }
 
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-RSI_LIMIT = float(os.getenv("RSI_LIMIT", "40"))
+RSI_WARNING_LIMIT = float(os.getenv("RSI_WARNING_LIMIT", os.getenv("RSI_LIMIT", "40")))
+RSI_EXTREME_LIMIT = float(os.getenv("RSI_EXTREME_LIMIT", "30"))
 CHECK_INTERVAL_MIN = int(os.getenv("CHECK_INTERVAL_MIN", "15"))
 
 BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
@@ -46,6 +47,25 @@ CANDLE_LIMIT = max(RSI_PERIOD + 50, 100)
 # Controle para nao enviar e-mail duplicado na mesma janela.
 _alerted = set()
 _scheduler: BackgroundScheduler | None = None
+
+ALERT_LEVELS = [
+    {
+        "key": "warning",
+        "limit": RSI_WARNING_LIMIT,
+        "subject": "RSI abaixo de {limit:g}",
+        "title": "Alerta RSI - Abaixo de {limit:g}",
+        "status": "Abaixo de {limit:g}",
+        "color": "#e67e22",
+    },
+    {
+        "key": "extreme",
+        "limit": RSI_EXTREME_LIMIT,
+        "subject": "RSI abaixo de {limit:g} - EXTREMO",
+        "title": "Alerta RSI extremo - Abaixo de {limit:g}",
+        "status": "Sobrevendido extremo",
+        "color": "#c0392b",
+    },
+]
 
 
 def utc_now() -> datetime:
@@ -155,20 +175,38 @@ def scan_rsi_values() -> tuple[list[dict], list[dict]]:
                 continue
 
             value = float(rsi.iloc[-1])
-            key = f"{symbol}_{tf_label}_{now_slot}"
-            is_alert = value < RSI_LIMIT
-            already_alerted = key in _alerted
+            triggered_levels = [
+                level
+                for level in ALERT_LEVELS
+                if value < level["limit"]
+            ]
             item = {
                 "symbol": symbol,
                 "tf": tf_label,
                 "rsi": round(value, 2),
-                "alert": is_alert,
-                "already_alerted_this_hour": already_alerted,
+                "alert": bool(triggered_levels),
+                "alert_levels": [level["key"] for level in triggered_levels],
+                "already_alerted_this_hour": [
+                    level["key"]
+                    for level in triggered_levels
+                    if f"{symbol}_{tf_label}_{level['key']}_{now_slot}" in _alerted
+                ],
             }
             values.append(item)
 
-            if is_alert and not already_alerted:
-                alerts.append({"symbol": symbol, "tf": tf_label, "rsi": value, "key": key})
+            for level in triggered_levels:
+                key = f"{symbol}_{tf_label}_{level['key']}_{now_slot}"
+                if key not in _alerted:
+                    alerts.append(
+                        {
+                            "symbol": symbol,
+                            "tf": tf_label,
+                            "rsi": value,
+                            "key": key,
+                            "level": level["key"],
+                            "limit": level["limit"],
+                        }
+                    )
 
     return values, alerts
 
@@ -197,13 +235,13 @@ def send_email(subject: str, body_html: str) -> bool:
         return False
 
 
-def build_email_html(alerts: list[dict]) -> str:
+def build_email_html(alerts: list[dict], alert_level: dict) -> str:
     """Monta um e-mail HTML com os alertas."""
     rows = ""
     for alert in alerts:
         value = alert["rsi"]
-        color = "#c0392b" if value < 30 else "#e67e22"
-        status = "Sobrevendido extremo" if value < 30 else f"Abaixo de {RSI_LIMIT:g}"
+        color = alert_level["color"]
+        status = alert_level["status"].format(limit=alert_level["limit"])
         rows += f"""
         <tr>
           <td style="padding:8px 12px;font-weight:bold">{html.escape(alert['symbol'])}</td>
@@ -216,7 +254,7 @@ def build_email_html(alerts: list[dict]) -> str:
     <html><body style="font-family:Arial,sans-serif;background:#f5f5f5;padding:20px">
       <div style="max-width:640px;margin:auto;background:white;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.1)">
         <div style="background:#1a1a2e;color:white;padding:20px 24px">
-          <h2 style="margin:0">Alerta RSI - Abaixo de {RSI_LIMIT:g}</h2>
+          <h2 style="margin:0">{alert_level['title'].format(limit=alert_level['limit'])}</h2>
           <p style="margin:4px 0 0;opacity:.8;font-size:13px">{utc_now().strftime('%d/%m/%Y %H:%M')} UTC</p>
         </div>
         <div style="padding:20px">
@@ -260,12 +298,21 @@ def check_rsi() -> list[dict]:
     _alerted = {key for key in _alerted if now_slot in key}
 
     if alerts:
-        pairs = ", ".join(sorted({alert["symbol"] for alert in alerts}))
-        subject = f"RSI abaixo de {RSI_LIMIT:g} - {pairs}"
-        if send_email(subject, build_email_html(alerts)):
-            _alerted.update(alert["key"] for alert in alerts)
-        else:
-            print("[ALERTA] E-mail nao enviado; alerta sera tentado novamente na proxima checagem.")
+        for alert_level in ALERT_LEVELS:
+            level_alerts = [
+                alert for alert in alerts if alert["level"] == alert_level["key"]
+            ]
+            if not level_alerts:
+                continue
+
+            pairs = ", ".join(sorted({alert["symbol"] for alert in level_alerts}))
+            subject = f"{alert_level['subject'].format(limit=alert_level['limit'])} - {pairs}"
+            if send_email(subject, build_email_html(level_alerts, alert_level)):
+                _alerted.update(alert["key"] for alert in level_alerts)
+            else:
+                print(
+                    "[ALERTA] E-mail nao enviado; alerta sera tentado novamente na proxima checagem."
+                )
     else:
         print("  Nenhum alerta disparado.")
 
@@ -304,7 +351,7 @@ def home():
         f"<p>Proxima verificacao em ate {CHECK_INTERVAL_MIN} minutos.</p>"
         f"<p>Pares: {', '.join(SYMBOLS)}</p>"
         f"<p>Timeframes: {', '.join(TIMEFRAMES.keys())}</p>"
-        f"<p>Alerta quando RSI &lt; {RSI_LIMIT:g}</p>"
+        f"<p>Alertas quando RSI &lt; {RSI_WARNING_LIMIT:g} e RSI &lt; {RSI_EXTREME_LIMIT:g}</p>"
         f"<p>Horario atual: {utc_now().strftime('%d/%m/%Y %H:%M')} UTC</p>"
     ), 200
 
@@ -325,14 +372,21 @@ def rsi_status():
             "checked_at_utc": utc_now().isoformat(),
             "config": {
                 "rsi_period": RSI_PERIOD,
-                "rsi_limit": RSI_LIMIT,
+                "rsi_warning_limit": RSI_WARNING_LIMIT,
+                "rsi_extreme_limit": RSI_EXTREME_LIMIT,
                 "check_interval_min": CHECK_INTERVAL_MIN,
                 "symbols": SYMBOLS,
                 "timeframes": list(TIMEFRAMES.keys()),
             },
             "email_configured": bool(EMAIL_FROM and EMAIL_TO and GMAIL_PASS),
             "pending_alerts": [
-                {"symbol": alert["symbol"], "tf": alert["tf"], "rsi": round(alert["rsi"], 2)}
+                {
+                    "symbol": alert["symbol"],
+                    "tf": alert["tf"],
+                    "rsi": round(alert["rsi"], 2),
+                    "level": alert["level"],
+                    "limit": alert["limit"],
+                }
                 for alert in alerts
             ],
             "values": values,
