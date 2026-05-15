@@ -48,6 +48,11 @@ CHECK_INTERVAL_MIN = int(os.getenv("CHECK_INTERVAL_MIN", "15"))
 LEVERAGE = float(os.getenv("LEVERAGE", "10"))
 BACKTEST_MIN_TRADES = int(os.getenv("BACKTEST_MIN_TRADES", "5"))
 BACKTEST_MAX_SIGNALS = int(os.getenv("BACKTEST_MAX_SIGNALS", "80"))
+TRAINING_INTERVAL_MIN = int(os.getenv("TRAINING_INTERVAL_MIN", "180"))
+TRAINING_CANDLE_LIMIT = int(os.getenv("TRAINING_CANDLE_LIMIT", "1000"))
+PLAN_MIN_WIN_RATE = float(os.getenv("PLAN_MIN_WIN_RATE", "58"))
+PLAN_MIN_PROFIT_FACTOR = float(os.getenv("PLAN_MIN_PROFIT_FACTOR", "1.15"))
+PLAN_MIN_AVG_ROI = float(os.getenv("PLAN_MIN_AVG_ROI", "0"))
 
 BINANCE_BASE_URLS = [
     url.strip().rstrip("/")
@@ -72,6 +77,12 @@ _last_scan = {
     "pending_alerts": [],
 }
 _last_email_results = []
+_model_lock = threading.Lock()
+_strategy_model = {
+    "trained_at_utc": None,
+    "running": False,
+    "stats": {},
+}
 
 ALERT_LEVELS = [
     {
@@ -227,6 +238,34 @@ def pct_fmt(value: float) -> str:
     return f"{value:.2f}%"
 
 
+def model_key(symbol: str, tf_label: str, level_key: str) -> str:
+    return f"{symbol}:{tf_label}:{level_key}"
+
+
+def get_strategy_stats(symbol: str, tf_label: str, level_key: str) -> dict | None:
+    with _model_lock:
+        return _strategy_model["stats"].get(model_key(symbol, tf_label, level_key))
+
+
+def is_backtest_qualified(backtest_stats: dict | None) -> tuple[bool, str]:
+    if not backtest_stats:
+        return False, "modelo ainda treinando"
+
+    if backtest_stats["sample_size"] < BACKTEST_MIN_TRADES:
+        return False, f"amostra insuficiente ({backtest_stats['sample_size']}/{BACKTEST_MIN_TRADES})"
+
+    if backtest_stats["win_rate_pct"] < PLAN_MIN_WIN_RATE:
+        return False, f"assertividade abaixo do minimo ({pct_fmt(backtest_stats['win_rate_pct'])})"
+
+    if backtest_stats["profit_factor"] < PLAN_MIN_PROFIT_FACTOR:
+        return False, f"payoff abaixo do minimo ({backtest_stats['profit_factor']:.2f})"
+
+    if backtest_stats["avg_roi_pct"] < PLAN_MIN_AVG_ROI:
+        return False, f"ROI medio abaixo do minimo ({pct_fmt(backtest_stats['avg_roi_pct'])})"
+
+    return True, "modelo aprovado pelo backtest"
+
+
 def build_trade_plan(
     df: pd.DataFrame,
     rsi_value: float,
@@ -308,6 +347,8 @@ def build_trade_plan(
         f"ATR aprox.: {pct_fmt(atr_pct)}",
     ]
 
+    qualified, qualification_reason = is_backtest_qualified(backtest_stats)
+
     if backtest_stats and backtest_stats["sample_size"] >= BACKTEST_MIN_TRADES:
         win_rate = backtest_stats["win_rate_pct"]
         if win_rate >= 65:
@@ -329,11 +370,18 @@ def build_trade_plan(
     else:
         notes.append("Backtest local: amostra insuficiente para calibrar confianca")
 
+    if not qualified:
+        confidence = "baixa"
+        score = min(score, 55)
+        notes.append(f"Plano ocultado: {qualification_reason}")
+
     return {
         "side": "long educativo",
         "leverage": LEVERAGE,
         "confidence": confidence,
         "score": score,
+        "qualified": qualified,
+        "qualification_reason": qualification_reason,
         "entry_price": entry_price,
         "entry_zone_low": entry_zone_low,
         "entry_zone_high": entry_zone_high,
@@ -427,6 +475,82 @@ def evaluate_backtest(df: pd.DataFrame, rsi_series: pd.Series, tf_label: str, le
     }
 
 
+def train_one_strategy(symbol: str, tf_label: str, tf_interval: str) -> dict:
+    df = get_candles(symbol, tf_interval, limit=TRAINING_CANDLE_LIMIT)
+    results = {}
+    if df is None:
+        for level in ALERT_LEVELS:
+            results[model_key(symbol, tf_label, level["key"])] = {
+                "sample_size": 0,
+                "win_rate_pct": 0.0,
+                "avg_roi_pct": 0.0,
+                "profit_factor": 0.0,
+                "error": "candles_unavailable",
+            }
+        return results
+
+    rsi_series = calc_rsi(df["close"])
+    for level in ALERT_LEVELS:
+        stats = evaluate_backtest(df, rsi_series, tf_label, level["key"])
+        qualified, reason = is_backtest_qualified(stats)
+        stats.update(
+            {
+                "symbol": symbol,
+                "tf": tf_label,
+                "level": level["key"],
+                "qualified": qualified,
+                "qualification_reason": reason,
+            }
+        )
+        results[model_key(symbol, tf_label, level["key"])] = stats
+
+    return results
+
+
+def train_strategy_model() -> bool:
+    """Treina/calibra as estatisticas historicas em background."""
+    if not _model_lock.acquire(blocking=False):
+        return False
+
+    if _strategy_model["running"]:
+        _model_lock.release()
+        return False
+
+    _strategy_model["running"] = True
+    _model_lock.release()
+
+    print("[TREINO] Iniciando calibracao historica dos planos RSI...")
+    jobs = [
+        (symbol, tf_label, tf_interval)
+        for symbol in SYMBOLS
+        for tf_label, tf_interval in TIMEFRAMES.items()
+    ]
+    stats = {}
+
+    try:
+        with ThreadPoolExecutor(max_workers=SCAN_MAX_WORKERS) as executor:
+            futures = [
+                executor.submit(train_one_strategy, symbol, tf_label, tf_interval)
+                for symbol, tf_label, tf_interval in jobs
+            ]
+            for future in as_completed(futures):
+                stats.update(future.result())
+
+        with _model_lock:
+            _strategy_model["trained_at_utc"] = utc_now().isoformat()
+            _strategy_model["running"] = False
+            _strategy_model["stats"] = stats
+
+        qualified_count = len([item for item in stats.values() if item.get("qualified")])
+        print(f"[TREINO] Concluido. Estrategias aprovadas: {qualified_count}/{len(stats)}.")
+        return True
+    except Exception as exc:
+        with _model_lock:
+            _strategy_model["running"] = False
+        print(f"[ERRO] Treino: {exc}")
+        return False
+
+
 def scan_one_rsi(symbol: str, tf_label: str, tf_interval: str, now_slot: str) -> tuple[dict, list[dict]]:
     """Calcula o RSI de um par/timeframe."""
     df = get_candles(symbol, tf_interval)
@@ -459,7 +583,7 @@ def scan_one_rsi(symbol: str, tf_label: str, tf_interval: str, now_slot: str) ->
     value = float(rsi.iloc[-1])
     triggered_levels = [level for level in ALERT_LEVELS if value < level["limit"]]
     plan_level = "extreme" if any(level["key"] == "extreme" for level in triggered_levels) else "warning"
-    backtest_stats = evaluate_backtest(df, calc_rsi(df["close"]), tf_label, plan_level) if triggered_levels else None
+    backtest_stats = get_strategy_stats(symbol, tf_label, plan_level) if triggered_levels else None
     plan = build_trade_plan(df, value, tf_label, plan_level, backtest_stats)
     item = {
         "symbol": symbol,
@@ -628,14 +752,8 @@ def build_email_html(alerts: list[dict], alert_level: dict) -> str:
         status = alert_level["status"].format(limit=alert_level["limit"])
         plan = alert["trade_plan"]
         plan_notes = "<br>".join(html.escape(note) for note in plan["notes"])
-        rows += f"""
-        <tr>
-          <td style="padding:8px 12px;font-weight:bold">{html.escape(alert['symbol'])}</td>
-          <td style="padding:8px 12px">{html.escape(alert['tf'])}</td>
-          <td style="padding:8px 12px">{price_fmt(alert['price'])}</td>
-          <td style="padding:8px 12px;color:{color};font-weight:bold">{value:.2f}</td>
-          <td style="padding:8px 12px">{status}</td>
-          <td style="padding:8px 12px;font-size:12px;line-height:1.45">
+        if plan["qualified"]:
+            plan_html = f"""
             <strong>Score:</strong> {plan['score']}/95 ({html.escape(plan['confidence'])})<br>
             <strong>Entrada:</strong> {price_fmt(plan['entry_price'])}
             <span style="color:#777">(zona {price_fmt(plan['entry_zone_low'])} - {price_fmt(plan['entry_zone_high'])})</span><br>
@@ -643,7 +761,24 @@ def build_email_html(alerts: list[dict], alert_level: dict) -> str:
             <strong>TP2:</strong> {price_fmt(plan['tp2_price'])} (+{pct_fmt(plan['tp2_price_pct'])}; ~{pct_fmt(plan['tp2_roi_pct'])} em {plan['leverage']:g}x)<br>
             <strong>SL:</strong> {price_fmt(plan['sl_price'])} (-{pct_fmt(plan['sl_price_pct'])}; ~-{pct_fmt(plan['sl_roi_pct'])} em {plan['leverage']:g}x)<br>
             <span style="color:#777">{plan_notes}</span>
-          </td>
+            """
+        else:
+            plan_html = f"""
+            <strong>Sem sugestao de entrada.</strong><br>
+            <span style="color:#777">
+              O alerta de RSI continua valido, mas o plano de TP/SL foi ocultado porque
+              {html.escape(plan['qualification_reason'])}.<br>
+              {plan_notes}
+            </span>
+            """
+        rows += f"""
+        <tr>
+          <td style="padding:8px 12px;font-weight:bold">{html.escape(alert['symbol'])}</td>
+          <td style="padding:8px 12px">{html.escape(alert['tf'])}</td>
+          <td style="padding:8px 12px">{price_fmt(alert['price'])}</td>
+          <td style="padding:8px 12px;color:{color};font-weight:bold">{value:.2f}</td>
+          <td style="padding:8px 12px">{status}</td>
+          <td style="padding:8px 12px;font-size:12px;line-height:1.45">{plan_html}</td>
         </tr>"""
 
     return f"""
@@ -751,8 +886,19 @@ def start_scheduler() -> None:
         coalesce=True,
         replace_existing=True,
     )
+    _scheduler.add_job(
+        train_strategy_model,
+        "interval",
+        minutes=TRAINING_INTERVAL_MIN,
+        id="train_strategy_model",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+        next_run_time=utc_now(),
+    )
     _scheduler.start()
     print(f"[SCHEDULER] Verificacao agendada a cada {CHECK_INTERVAL_MIN} minutos.")
+    print(f"[SCHEDULER] Treino agendado a cada {TRAINING_INTERVAL_MIN} minutos.")
 
 
 @app.route("/")
@@ -783,6 +929,16 @@ def force_check():
     return f"Verificacao executada. Alertas encontrados: {len(alerts)}. Nenhum e-mail pendente.", 200
 
 
+@app.route("/train")
+def force_train():
+    """Forca treinamento/calibracao historica."""
+    started = train_strategy_model()
+    if started:
+        return "Treinamento executado. Confira /rsi para ver estrategias aprovadas.", 200
+
+    return "Treinamento ja esta em andamento. Confira /rsi em instantes.", 202
+
+
 @app.route("/rsi")
 def rsi_status():
     """Mostra os RSI que o app calculou por ultimo, sem travar em consultas externas."""
@@ -801,6 +957,11 @@ def rsi_status():
                 "leverage": LEVERAGE,
                 "backtest_min_trades": BACKTEST_MIN_TRADES,
                 "backtest_max_signals": BACKTEST_MAX_SIGNALS,
+                "training_interval_min": TRAINING_INTERVAL_MIN,
+                "training_candle_limit": TRAINING_CANDLE_LIMIT,
+                "plan_min_win_rate": PLAN_MIN_WIN_RATE,
+                "plan_min_profit_factor": PLAN_MIN_PROFIT_FACTOR,
+                "plan_min_avg_roi": PLAN_MIN_AVG_ROI,
                 "display_timezone": DISPLAY_TIMEZONE,
                 "binance_base_urls": BINANCE_BASE_URLS,
                 "symbols": SYMBOLS,
@@ -811,6 +972,15 @@ def rsi_status():
             "resend_from": RESEND_FROM if RESEND_API_KEY else None,
             "last_email_results": _last_email_results,
             "scan_running": _scan_lock.locked(),
+            "strategy_model": {
+                "trained_at_utc": _strategy_model["trained_at_utc"],
+                "running": _strategy_model["running"],
+                "qualified_count": len(
+                    [item for item in _strategy_model["stats"].values() if item.get("qualified")]
+                ),
+                "total_count": len(_strategy_model["stats"]),
+                "stats": _strategy_model["stats"],
+            },
             "pending_alerts": _last_scan["pending_alerts"],
             "values": _last_scan["values"],
         }
