@@ -57,6 +57,8 @@ PLAN_MIN_WIN_RATE = float(os.getenv("PLAN_MIN_WIN_RATE", "60"))
 PLAN_MIN_PROFIT_FACTOR = float(os.getenv("PLAN_MIN_PROFIT_FACTOR", "1.25"))
 PLAN_MIN_AVG_ROI = float(os.getenv("PLAN_MIN_AVG_ROI", "0"))
 PLAN_MIN_SCORE = int(os.getenv("PLAN_MIN_SCORE", "60"))
+CONTEXT_MIN_SCORE = int(os.getenv("CONTEXT_MIN_SCORE", "55"))
+CONTEXT_MIN_FILTERS = int(os.getenv("CONTEXT_MIN_FILTERS", "4"))
 TRADE_COST_ROI_PCT = float(os.getenv("TRADE_COST_ROI_PCT", "1.2"))
 OPTIMIZE_TRADE_PARAMS = os.getenv("OPTIMIZE_TRADE_PARAMS", "true").lower() in {
     "1",
@@ -65,17 +67,17 @@ OPTIMIZE_TRADE_PARAMS = os.getenv("OPTIMIZE_TRADE_PARAMS", "true").lower() in {
 }
 TP1_ROI_GRID = [
     float(value)
-    for value in os.getenv("TP1_ROI_GRID", "20,30,40").split(",")
+    for value in os.getenv("TP1_ROI_GRID", "25,35").split(",")
     if value.strip()
 ]
 TP2_ROI_GRID = [
     float(value)
-    for value in os.getenv("TP2_ROI_GRID", "35,50,70").split(",")
+    for value in os.getenv("TP2_ROI_GRID", "45,65").split(",")
     if value.strip()
 ]
 SL_ROI_GRID = [
     float(value)
-    for value in os.getenv("SL_ROI_GRID", "8,12,18").split(",")
+    for value in os.getenv("SL_ROI_GRID", "10,16").split(",")
     if value.strip()
 ]
 SEND_ONLY_QUALIFIED_SIGNALS = os.getenv("SEND_ONLY_QUALIFIED_SIGNALS", "true").lower() in {
@@ -114,6 +116,7 @@ _strategy_model = {
     "stats": {},
     "history": [],
 }
+_market_context = {}
 
 ALERT_LEVELS = [
     {
@@ -294,6 +297,149 @@ def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return true_range.rolling(period, min_periods=period).mean()
 
 
+def calc_ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False, min_periods=period).mean()
+
+
+def calc_context_score(
+    df: pd.DataFrame,
+    rsi_series: pd.Series,
+    tf_label: str,
+    symbol: str | None = None,
+) -> dict:
+    """Pontua contexto tecnico para evitar sinais de RSI isolados."""
+    close = float(df["close"].iloc[-1])
+    open_ = float(df["open"].iloc[-1])
+    high = float(df["high"].iloc[-1])
+    low = float(df["low"].iloc[-1])
+    previous_close = float(df["close"].iloc[-2]) if len(df) >= 2 else close
+    previous_open = float(df["open"].iloc[-2]) if len(df) >= 2 else open_
+
+    ma20 = float(df["close"].tail(20).mean())
+    ma50 = float(df["close"].tail(50).mean())
+    ma200 = float(df["close"].tail(200).mean()) if len(df) >= 200 else ma50
+    ema9 = float(calc_ema(df["close"], 9).dropna().iloc[-1]) if len(df) >= 9 else ma20
+    ema21 = float(calc_ema(df["close"], 21).dropna().iloc[-1]) if len(df) >= 21 else ma50
+    volume = pd.to_numeric(df["volume"], errors="coerce") if "volume" in df else pd.Series(dtype=float)
+    volume_now = float(volume.iloc[-1]) if not volume.empty and pd.notna(volume.iloc[-1]) else 0
+    volume_avg = float(volume.tail(20).mean()) if not volume.empty else 0
+
+    atr_series = calc_atr(df)
+    atr = float(atr_series.dropna().iloc[-1]) if not atr_series.dropna().empty else close * 0.015
+    atr_pct = (atr / close) * 100 if close else 0
+    swing = df.tail(80)
+    swing_low = float(swing["low"].min())
+    swing_high = float(swing["high"].max())
+    swing_range = max(swing_high - swing_low, close * 0.001)
+    range_position = (close - swing_low) / swing_range
+    near_support = close <= swing_low + (swing_range * 0.25)
+
+    body = abs(close - open_)
+    candle_range = max(high - low, close * 0.001)
+    lower_wick = min(open_, close) - low
+    bullish_candle = close > open_
+    bullish_engulfing = bullish_candle and previous_close < previous_open and close > previous_open
+    hammer_like = lower_wick >= body * 1.5 and close >= low + (candle_range * 0.55)
+
+    rsi_now = float(rsi_series.dropna().iloc[-1]) if not rsi_series.dropna().empty else 50
+    rsi_prev = float(rsi_series.dropna().iloc[-2]) if len(rsi_series.dropna()) >= 2 else rsi_now
+    rsi_recovering = rsi_now > rsi_prev
+    rsi_deep = rsi_now <= RSI_EXTREME_LIMIT
+
+    btc_context = _market_context.get("BTCUSDT", {})
+    btc_4h_ok = btc_context.get("4h", {}).get("trend_ok", True)
+    btc_1d_ok = btc_context.get("1d", {}).get("trend_ok", True)
+    market_ok = True if symbol == "BTCUSDT" else btc_4h_ok and btc_1d_ok
+
+    filters = [
+        {
+            "name": "RSI recuperando",
+            "passed": rsi_recovering,
+            "weight": 14,
+            "detail": f"RSI {rsi_prev:.2f} -> {rsi_now:.2f}",
+        },
+        {
+            "name": "RSI extremo",
+            "passed": rsi_deep,
+            "weight": 10,
+            "detail": f"RSI <= {RSI_EXTREME_LIMIT:g}",
+        },
+        {
+            "name": "Perto de suporte/range baixo",
+            "passed": near_support,
+            "weight": 14,
+            "detail": f"posicao no range {range_position:.2f}",
+        },
+        {
+            "name": "Candle de reversao",
+            "passed": bullish_engulfing or hammer_like,
+            "weight": 12,
+            "detail": "engolfo/hammer" if bullish_engulfing or hammer_like else "sem candle claro",
+        },
+        {
+            "name": "EMA curta melhorando",
+            "passed": close > ema9 or ema9 > ema21,
+            "weight": 10,
+            "detail": f"close/EMA9/EMA21 {price_fmt(close)}/{price_fmt(ema9)}/{price_fmt(ema21)}",
+        },
+        {
+            "name": "MA20 acima da MA50",
+            "passed": ma20 > ma50,
+            "weight": 10,
+            "detail": f"MA20 {price_fmt(ma20)} MA50 {price_fmt(ma50)}",
+        },
+        {
+            "name": "Nao muito abaixo da MA200",
+            "passed": close >= ma200 * 0.97,
+            "weight": 8,
+            "detail": f"MA200 {price_fmt(ma200)}",
+        },
+        {
+            "name": "Volume acima da media",
+            "passed": volume_avg > 0 and volume_now >= volume_avg * 1.1,
+            "weight": 8,
+            "detail": f"vol {volume_now:.0f}/{volume_avg:.0f}",
+        },
+        {
+            "name": "BTC 4h/1d favoravel",
+            "passed": market_ok,
+            "weight": 14,
+            "detail": "ok" if market_ok else "BTC contexto fraco",
+        },
+    ]
+
+    passed = [item for item in filters if item["passed"]]
+    total_weight = sum(item["weight"] for item in filters)
+    score = round((sum(item["weight"] for item in passed) / total_weight) * 100, 2)
+
+    return {
+        "score": score,
+        "passed_count": len(passed),
+        "total_count": len(filters),
+        "passed_filters": [item["name"] for item in passed],
+        "failed_filters": [item["name"] for item in filters if not item["passed"]],
+        "filters": filters,
+        "atr_pct": round(atr_pct, 2),
+        "range_position": round(range_position, 3),
+        "market_ok": market_ok,
+    }
+
+
+def update_market_context(symbol: str, tf_label: str, df: pd.DataFrame) -> None:
+    if symbol != "BTCUSDT" or tf_label not in {"4h", "1d"}:
+        return
+
+    ma20 = float(df["close"].tail(20).mean())
+    ma50 = float(df["close"].tail(50).mean())
+    close = float(df["close"].iloc[-1])
+    _market_context.setdefault(symbol, {})[tf_label] = {
+        "trend_ok": close >= ma50 * 0.98 or ma20 > ma50,
+        "close": close,
+        "ma20": ma20,
+        "ma50": ma50,
+    }
+
+
 def price_fmt(value: float) -> str:
     if value >= 100:
         return f"{value:.2f}"
@@ -354,6 +500,16 @@ def is_plan_sendable(plan: dict | None) -> tuple[bool, str]:
     if plan["confidence"] not in {"media", "alta"}:
         return False, f"confianca insuficiente ({plan['confidence']})"
 
+    context = plan.get("context")
+    if not context:
+        return False, "sem contexto tecnico"
+
+    if context["score"] < CONTEXT_MIN_SCORE:
+        return False, f"contexto abaixo do minimo ({context['score']:.2f}/{CONTEXT_MIN_SCORE})"
+
+    if context["passed_count"] < CONTEXT_MIN_FILTERS:
+        return False, f"poucos filtros alinhados ({context['passed_count']}/{CONTEXT_MIN_FILTERS})"
+
     return True, "call aprovada para envio"
 
 
@@ -364,6 +520,7 @@ def build_trade_plan(
     level_key: str,
     backtest_stats: dict | None = None,
     params: dict | None = None,
+    context: dict | None = None,
 ) -> dict:
     """Gera um plano tecnico educacional, sem automatizar ordem."""
     close = float(df["close"].iloc[-1])
@@ -482,6 +639,19 @@ def build_trade_plan(
         score = min(score, 55)
         notes.append(f"Plano ocultado: {qualification_reason}")
 
+    if context:
+        if context["score"] >= 75 and qualified:
+            score = min(score + 5, 95)
+            confidence = "alta" if score >= 75 else confidence
+        elif context["score"] < CONTEXT_MIN_SCORE:
+            score = min(score, 55)
+            confidence = "baixa"
+        notes.append(
+            f"Contexto tecnico: {context['score']:.2f}/100; "
+            f"{context['passed_count']}/{context['total_count']} filtros alinhados"
+        )
+        notes.append("Filtros favoraveis: " + ", ".join(context["passed_filters"][:5]))
+
     return {
         "side": "long educativo",
         "leverage": LEVERAGE,
@@ -505,6 +675,7 @@ def build_trade_plan(
         "range_position": round(range_position, 3),
         "notes": notes,
         "backtest": backtest_stats,
+        "context": context,
         "summary": (
             f"Entrada ref. {price_fmt(entry_price)} | "
             f"TP1 +{pct_fmt(tp1_price_pct)} (~{pct_fmt(tp1_roi_pct)} em {LEVERAGE:g}x) | "
@@ -602,7 +773,15 @@ def simulate_signals(
     for index in signal_indexes:
         historical_df = df.iloc[: index + 1]
         historical_rsi = float(rsi_series.iloc[index])
-        plan = build_trade_plan(historical_df, historical_rsi, tf_label, level_key, params=params)
+        context = calc_context_score(historical_df, rsi_series.iloc[: index + 1], tf_label)
+        plan = build_trade_plan(
+            historical_df,
+            historical_rsi,
+            tf_label,
+            level_key,
+            params=params,
+            context=context,
+        )
         outcome = simulate_trade_outcome(df, index, plan, tf_label)
         if outcome["outcome"] != "open":
             trades.append(outcome)
@@ -944,6 +1123,8 @@ def build_model_report() -> dict:
             "plan_min_profit_factor": PLAN_MIN_PROFIT_FACTOR,
             "plan_min_avg_roi": PLAN_MIN_AVG_ROI,
             "plan_min_score": PLAN_MIN_SCORE,
+            "context_min_score": CONTEXT_MIN_SCORE,
+            "context_min_filters": CONTEXT_MIN_FILTERS,
             "trade_cost_roi_pct": TRADE_COST_ROI_PCT,
             "optimize_trade_params": OPTIMIZE_TRADE_PARAMS,
             "tp1_roi_grid": TP1_ROI_GRID,
@@ -1022,12 +1203,22 @@ def scan_one_rsi(symbol: str, tf_label: str, tf_interval: str, now_slot: str) ->
             [],
         )
 
+    update_market_context(symbol, tf_label, df)
     value = float(rsi.iloc[-1])
     triggered_levels = [level for level in ALERT_LEVELS if value < level["limit"]]
     plan_level = "extreme" if any(level["key"] == "extreme" for level in triggered_levels) else "warning"
     backtest_stats = get_strategy_stats(symbol, tf_label, plan_level) if triggered_levels else None
     plan_params = backtest_stats.get("selected_params") if backtest_stats else None
-    plan = build_trade_plan(df, value, tf_label, plan_level, backtest_stats, params=plan_params)
+    context = calc_context_score(df, calc_rsi(df["close"]), tf_label, symbol) if triggered_levels else None
+    plan = build_trade_plan(
+        df,
+        value,
+        tf_label,
+        plan_level,
+        backtest_stats,
+        params=plan_params,
+        context=context,
+    )
     item = {
         "symbol": symbol,
         "tf": tf_label,
@@ -1207,6 +1398,7 @@ def build_email_html(alerts: list[dict], alert_level: dict) -> str:
             <strong>TP1:</strong> {price_fmt(plan['tp1_price'])} (+{pct_fmt(plan['tp1_price_pct'])}; ~{pct_fmt(plan['tp1_roi_pct'])} em {plan['leverage']:g}x)<br>
             <strong>TP2:</strong> {price_fmt(plan['tp2_price'])} (+{pct_fmt(plan['tp2_price_pct'])}; ~{pct_fmt(plan['tp2_roi_pct'])} em {plan['leverage']:g}x)<br>
             <strong>SL:</strong> {price_fmt(plan['sl_price'])} (-{pct_fmt(plan['sl_price_pct'])}; ~-{pct_fmt(plan['sl_roi_pct'])} em {plan['leverage']:g}x)<br>
+            <strong>Contexto:</strong> {plan['context']['score']:.2f}/100 ({plan['context']['passed_count']}/{plan['context']['total_count']} filtros)<br>
             <span style="color:#777">{plan_notes}</span>
             """
         else:
@@ -1430,6 +1622,8 @@ def rsi_status():
                 "plan_min_profit_factor": PLAN_MIN_PROFIT_FACTOR,
                 "plan_min_avg_roi": PLAN_MIN_AVG_ROI,
                 "plan_min_score": PLAN_MIN_SCORE,
+                "context_min_score": CONTEXT_MIN_SCORE,
+                "context_min_filters": CONTEXT_MIN_FILTERS,
                 "trade_cost_roi_pct": TRADE_COST_ROI_PCT,
                 "optimize_trade_params": OPTIMIZE_TRADE_PARAMS,
                 "tp1_roi_grid": TP1_ROI_GRID,

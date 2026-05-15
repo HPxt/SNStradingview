@@ -98,6 +98,10 @@ class StrategyModelTests(unittest.TestCase):
                 "qualification_reason": "modelo aprovado pelo backtest",
                 "score": main.PLAN_MIN_SCORE,
                 "confidence": "media",
+                "context": {
+                    "score": main.CONTEXT_MIN_SCORE,
+                    "passed_count": main.CONTEXT_MIN_FILTERS,
+                },
             }
         )
 

@@ -61,8 +61,13 @@ Opcionais:
 | `PLAN_MIN_PROFIT_FACTOR` | `1.25` | Profit factor minimo para mostrar plano no e-mail |
 | `PLAN_MIN_AVG_ROI` | `0` | ROI medio minimo simulado para mostrar plano no e-mail |
 | `PLAN_MIN_SCORE` | `60` | Score minimo da call para enviar e-mail |
+| `CONTEXT_MIN_SCORE` | `55` | Score minimo dos filtros de contexto tecnico |
+| `CONTEXT_MIN_FILTERS` | `4` | Quantidade minima de filtros alinhados para validar a call |
 | `TRADE_COST_ROI_PCT` | `1.2` | Custo estimado por trade em ROI alavancado, usado no backtest |
 | `OPTIMIZE_TRADE_PARAMS` | `true` | Testa combinacoes de TP/SL no treino e valida fora da amostra |
+| `TP1_ROI_GRID` | `25,35` | Grade de TP1 em ROI alavancado para otimizacao |
+| `TP2_ROI_GRID` | `45,65` | Grade de TP2 em ROI alavancado para otimizacao |
+| `SL_ROI_GRID` | `10,16` | Grade de stop em ROI alavancado para otimizacao |
 | `SEND_ONLY_QUALIFIED_SIGNALS` | `true` | Quando `true`, so envia e-mail se a call completa passar nos filtros |
 | `BINANCE_BASE_URLS` | `https://data-api.binance.vision,https://api1.binance.com,https://api.binance.com` | URLs da Binance para tentar em ordem |
 | `DISABLE_SCHEDULER` | vazio | Use `true` para desativar o agendador |
