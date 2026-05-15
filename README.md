@@ -59,10 +59,12 @@ Opcionais:
 | `PLAN_MIN_WIN_RATE` | `60` | Assertividade minima para mostrar entrada/TP/SL no e-mail |
 | `PLAN_MIN_PROFIT_FACTOR` | `1.25` | Profit factor minimo para mostrar plano no e-mail |
 | `PLAN_MIN_AVG_ROI` | `0` | ROI medio minimo simulado para mostrar plano no e-mail |
+| `PLAN_MIN_SCORE` | `60` | Score minimo da call para enviar e-mail |
+| `SEND_ONLY_QUALIFIED_SIGNALS` | `true` | Quando `true`, so envia e-mail se a call completa passar nos filtros |
 | `BINANCE_BASE_URLS` | `https://data-api.binance.vision,https://api1.binance.com,https://api.binance.com` | URLs da Binance para tentar em ordem |
 | `DISABLE_SCHEDULER` | vazio | Use `true` para desativar o agendador |
 
-Os planos de entrada/TP/SL enviados por e-mail sao educativos e baseados em indicadores tecnicos. O app so mostra o plano quando o backtest local passa os filtros minimos de assertividade, ROI e payoff. Eles nao executam ordens e nao substituem gestao de risco.
+Os planos de entrada/TP/SL enviados por e-mail sao educativos e baseados em indicadores tecnicos. Por padrao, o app so envia e-mail quando a call completa passa os filtros minimos de assertividade, ROI, payoff, score e confianca. Candidatos recusados podem ser vistos em `/rsi`, mas nao viram e-mail. Eles nao executam ordens e nao substituem gestao de risco.
 
 ## Configurar Gmail
 

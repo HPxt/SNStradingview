@@ -55,6 +55,12 @@ TRAINING_CANDLE_LIMIT = int(os.getenv("TRAINING_CANDLE_LIMIT", "1000"))
 PLAN_MIN_WIN_RATE = float(os.getenv("PLAN_MIN_WIN_RATE", "60"))
 PLAN_MIN_PROFIT_FACTOR = float(os.getenv("PLAN_MIN_PROFIT_FACTOR", "1.25"))
 PLAN_MIN_AVG_ROI = float(os.getenv("PLAN_MIN_AVG_ROI", "0"))
+PLAN_MIN_SCORE = int(os.getenv("PLAN_MIN_SCORE", "60"))
+SEND_ONLY_QUALIFIED_SIGNALS = os.getenv("SEND_ONLY_QUALIFIED_SIGNALS", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 BINANCE_BASE_URLS = [
     url.strip().rstrip("/")
@@ -273,6 +279,22 @@ def is_backtest_qualified(backtest_stats: dict | None) -> tuple[bool, str]:
         return False, f"risco de overfitting alto (gap {pct_fmt(backtest_stats['overfit_gap_pct'])})"
 
     return True, "modelo aprovado pelo backtest"
+
+
+def is_plan_sendable(plan: dict | None) -> tuple[bool, str]:
+    if not plan:
+        return False, "sem plano tecnico"
+
+    if not plan["qualified"]:
+        return False, plan["qualification_reason"]
+
+    if plan["score"] < PLAN_MIN_SCORE:
+        return False, f"score abaixo do minimo ({plan['score']}/{PLAN_MIN_SCORE})"
+
+    if plan["confidence"] not in {"media", "alta"}:
+        return False, f"confianca insuficiente ({plan['confidence']})"
+
+    return True, "call aprovada para envio"
 
 
 def build_trade_plan(
@@ -652,11 +674,15 @@ def scan_one_rsi(symbol: str, tf_label: str, tf_interval: str, now_slot: str) ->
         ],
         "trade_plan": plan if triggered_levels else None,
     }
+    sendable, send_reason = is_plan_sendable(plan) if triggered_levels else (False, "sem alerta")
+    item["signal_ready"] = sendable
+    item["signal_reason"] = send_reason
 
     alerts = []
     for level in triggered_levels:
         key = f"{symbol}_{tf_label}_{level['key']}_{now_slot}"
-        if key not in _alerted:
+        should_send = sendable or not SEND_ONLY_QUALIFIED_SIGNALS
+        if should_send and key not in _alerted:
             alerts.append(
                 {
                     "symbol": symbol,
@@ -865,7 +891,7 @@ def build_email_html(alerts: list[dict], alert_level: dict) -> str:
 
 
 def check_rsi() -> list[dict]:
-    """Verifica o RSI de todos os pares e timeframes."""
+    """Verifica o RSI e retorna apenas sinais aprovados para envio."""
     global _alerted, _last_email_results
 
     now = utc_now()
@@ -962,6 +988,7 @@ def home():
         f"<p>Pares: {', '.join(SYMBOLS)}</p>"
         f"<p>Timeframes: {', '.join(TIMEFRAMES.keys())}</p>"
         f"<p>Alertas quando RSI &lt; {RSI_WARNING_LIMIT:g} e RSI &lt; {RSI_EXTREME_LIMIT:g}</p>"
+        f"<p>E-mail apenas quando call qualificada: {SEND_ONLY_QUALIFIED_SIGNALS}</p>"
         f"<p>Horario atual: {format_display_time()}</p>"
     ), 200
 
@@ -974,12 +1001,16 @@ def force_check():
         sent = sum(1 for result in _last_email_results if result["sent"])
         failed = sum(1 for result in _last_email_results if not result["sent"])
         return (
-            f"Verificacao executada. Alertas encontrados: {len(alerts)}. "
+            f"Verificacao executada. Sinais qualificados: {len(alerts)}. "
             f"E-mails enviados: {sent}. Falhas de e-mail: {failed}.",
             200,
         )
 
-    return f"Verificacao executada. Alertas encontrados: {len(alerts)}. Nenhum e-mail pendente.", 200
+    return (
+        f"Verificacao executada. Sinais qualificados: {len(alerts)}. "
+        "Nenhum e-mail pendente. Veja /rsi para candidatos recusados.",
+        200,
+    )
 
 
 @app.route("/train")
@@ -1017,6 +1048,8 @@ def rsi_status():
                 "plan_min_win_rate": PLAN_MIN_WIN_RATE,
                 "plan_min_profit_factor": PLAN_MIN_PROFIT_FACTOR,
                 "plan_min_avg_roi": PLAN_MIN_AVG_ROI,
+                "plan_min_score": PLAN_MIN_SCORE,
+                "send_only_qualified_signals": SEND_ONLY_QUALIFIED_SIGNALS,
                 "display_timezone": DISPLAY_TIMEZONE,
                 "binance_base_urls": BINANCE_BASE_URLS,
                 "symbols": SYMBOLS,

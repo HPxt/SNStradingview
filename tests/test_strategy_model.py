@@ -65,6 +65,45 @@ class StrategyModelTests(unittest.TestCase):
         self.assertIn("overfit_warning", stats)
         self.assertGreaterEqual(stats["sample_size"], 0)
 
+    def test_plan_must_be_qualified_to_send(self):
+        sendable, reason = main.is_plan_sendable(
+            {
+                "qualified": False,
+                "qualification_reason": "assertividade abaixo do minimo",
+                "score": 95,
+                "confidence": "alta",
+            }
+        )
+
+        self.assertFalse(sendable)
+        self.assertIn("assertividade", reason)
+
+    def test_plan_must_reach_min_score_to_send(self):
+        sendable, reason = main.is_plan_sendable(
+            {
+                "qualified": True,
+                "qualification_reason": "modelo aprovado pelo backtest",
+                "score": main.PLAN_MIN_SCORE - 1,
+                "confidence": "alta",
+            }
+        )
+
+        self.assertFalse(sendable)
+        self.assertIn("score", reason)
+
+    def test_qualified_plan_can_send(self):
+        sendable, reason = main.is_plan_sendable(
+            {
+                "qualified": True,
+                "qualification_reason": "modelo aprovado pelo backtest",
+                "score": main.PLAN_MIN_SCORE,
+                "confidence": "media",
+            }
+        )
+
+        self.assertTrue(sendable)
+        self.assertIn("aprovada", reason)
+
 
 if __name__ == "__main__":
     unittest.main()
