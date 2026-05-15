@@ -49,8 +49,11 @@ Opcionais:
 | `RSI_WARNING_LIMIT` | `40` | Dispara alerta quando RSI fica abaixo deste valor |
 | `RSI_EXTREME_LIMIT` | `30` | Dispara alerta extremo separado quando RSI fica abaixo deste valor |
 | `CHECK_INTERVAL_MIN` | `15` | Intervalo entre verificacoes |
+| `LEVERAGE` | `10` | Alavancagem usada apenas para estimar TP/SL no alerta |
 | `BINANCE_BASE_URLS` | `https://data-api.binance.vision,https://api1.binance.com,https://api.binance.com` | URLs da Binance para tentar em ordem |
 | `DISABLE_SCHEDULER` | vazio | Use `true` para desativar o agendador |
+
+Os planos de entrada/TP/SL enviados por e-mail sao educativos e baseados em indicadores tecnicos. Eles nao executam ordens e nao substituem gestao de risco.
 
 ## Configurar Gmail
 

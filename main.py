@@ -45,6 +45,7 @@ RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 RSI_WARNING_LIMIT = float(os.getenv("RSI_WARNING_LIMIT", os.getenv("RSI_LIMIT", "40")))
 RSI_EXTREME_LIMIT = float(os.getenv("RSI_EXTREME_LIMIT", "30"))
 CHECK_INTERVAL_MIN = int(os.getenv("CHECK_INTERVAL_MIN", "15"))
+LEVERAGE = float(os.getenv("LEVERAGE", "10"))
 
 BINANCE_BASE_URLS = [
     url.strip().rstrip("/")
@@ -56,7 +57,7 @@ BINANCE_BASE_URLS = [
 ]
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "2.5"))
 SCAN_MAX_WORKERS = int(os.getenv("SCAN_MAX_WORKERS", "8"))
-CANDLE_LIMIT = max(RSI_PERIOD + 50, 100)
+CANDLE_LIMIT = max(RSI_PERIOD + 220, 250)
 
 # Controle para nao enviar e-mail duplicado na mesma janela.
 _alerted = set()
@@ -88,6 +89,13 @@ ALERT_LEVELS = [
         "color": "#c0392b",
     },
 ]
+
+TIMEFRAME_PRIORITY = {
+    "15m": 1,
+    "1h": 2,
+    "4h": 3,
+    "1d": 4,
+}
 
 
 def utc_now() -> datetime:
@@ -130,8 +138,13 @@ def get_candles(symbol: str, interval: str, limit: int = CANDLE_LIMIT) -> pd.Dat
                     "ignore",
                 ],
             )
-            df = df.assign(close=pd.to_numeric(df["close"], errors="coerce"))
-            df = df.dropna(subset=["close"])
+            df = df.assign(
+                open=pd.to_numeric(df["open"], errors="coerce"),
+                high=pd.to_numeric(df["high"], errors="coerce"),
+                low=pd.to_numeric(df["low"], errors="coerce"),
+                close=pd.to_numeric(df["close"], errors="coerce"),
+            )
+            df = df.dropna(subset=["open", "high", "low", "close"])
             if not df.empty:
                 _last_candle_errors.pop(f"{symbol}_{interval}", None)
                 return df
@@ -179,6 +192,136 @@ def calc_rsi(series: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
     return rsi
 
 
+def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calcula ATR simples para medir volatilidade recente."""
+    previous_close = df["close"].shift(1)
+    true_range = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - previous_close).abs(),
+            (df["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return true_range.rolling(period, min_periods=period).mean()
+
+
+def price_fmt(value: float) -> str:
+    if value >= 100:
+        return f"{value:.2f}"
+    if value >= 1:
+        return f"{value:.4f}"
+    return f"{value:.6f}"
+
+
+def pct_fmt(value: float) -> str:
+    return f"{value:.2f}%"
+
+
+def build_trade_plan(df: pd.DataFrame, rsi_value: float, tf_label: str, level_key: str) -> dict:
+    """Gera um plano tecnico educacional, sem automatizar ordem."""
+    close = float(df["close"].iloc[-1])
+    atr_series = calc_atr(df)
+    atr = float(atr_series.dropna().iloc[-1]) if not atr_series.dropna().empty else close * 0.015
+    atr_pct = (atr / close) * 100 if close else 0
+
+    recent = df.tail(20)
+    swing = df.tail(80)
+    recent_low = float(recent["low"].min())
+    recent_high = float(recent["high"].max())
+    swing_low = float(swing["low"].min())
+    swing_high = float(swing["high"].max())
+    swing_range = max(swing_high - swing_low, close * 0.001)
+    range_position = (close - swing_low) / swing_range
+
+    ma20 = float(df["close"].tail(20).mean())
+    ma50 = float(df["close"].tail(50).mean())
+    ma200 = float(df["close"].tail(200).mean()) if len(df) >= 200 else ma50
+    trend_bias = "alta" if ma20 > ma50 else "baixa"
+
+    priority = TIMEFRAME_PRIORITY.get(tf_label, 1)
+    rsi_depth = max(0, RSI_WARNING_LIMIT - rsi_value)
+    extreme_bonus = 12 if level_key == "extreme" else 0
+
+    score = 38 + (priority * 8) + min(rsi_depth * 1.4, 18) + extreme_bonus
+    if close <= recent_low * 1.015:
+        score += 8
+    if range_position <= 0.382:
+        score += 8
+    if ma20 > ma50:
+        score += 7
+    if close < ma200:
+        score -= 5
+    score = max(0, min(round(score), 95))
+
+    if score >= 75:
+        confidence = "alta"
+    elif score >= 58:
+        confidence = "media"
+    else:
+        confidence = "baixa"
+
+    entry_price = close
+    entry_pullback_pct = min(max(atr_pct * 0.25, 0.25), 1.2)
+    entry_zone_low = entry_price * (1 - entry_pullback_pct / 100)
+    entry_zone_high = entry_price * (1 + 0.15 / 100)
+
+    tp1_roi_pct = min(30 + ((priority - 1) * 10) + extreme_bonus, 85)
+    tp2_roi_pct = min(50 + ((priority - 1) * 15) + (extreme_bonus * 1.25), 130)
+    tp1_price_pct = tp1_roi_pct / LEVERAGE
+    tp2_price_pct = tp2_roi_pct / LEVERAGE
+
+    support_sl_pct = max(((entry_price - recent_low) / entry_price) * 100 + (atr_pct * 0.35), 0)
+    sl_price_pct = min(max(support_sl_pct, atr_pct * 1.2, 1.0), 6.0)
+    sl_roi_pct = sl_price_pct * LEVERAGE
+
+    tp1_price = entry_price * (1 + tp1_price_pct / 100)
+    tp2_price = entry_price * (1 + tp2_price_pct / 100)
+    sl_price = entry_price * (1 - sl_price_pct / 100)
+
+    fib_note = "correcao profunda perto do fundo recente"
+    if range_position > 0.618:
+        fib_note = "preco ainda alto no range recente"
+    elif range_position > 0.382:
+        fib_note = "meio do range, aguardar confirmacao reduz risco"
+
+    notes = [
+        f"Prioridade {tf_label}: {priority}/4",
+        f"RSI {rsi_value:.2f}",
+        f"Tendencia curta: {trend_bias} (MA20 {'>' if ma20 > ma50 else '<='} MA50)",
+        f"Leitura tipo Elliott/Fibo: {fib_note}",
+        f"ATR aprox.: {pct_fmt(atr_pct)}",
+    ]
+
+    return {
+        "side": "long educativo",
+        "leverage": LEVERAGE,
+        "confidence": confidence,
+        "score": score,
+        "entry_price": entry_price,
+        "entry_zone_low": entry_zone_low,
+        "entry_zone_high": entry_zone_high,
+        "tp1_price": tp1_price,
+        "tp1_price_pct": tp1_price_pct,
+        "tp1_roi_pct": tp1_roi_pct,
+        "tp2_price": tp2_price,
+        "tp2_price_pct": tp2_price_pct,
+        "tp2_roi_pct": tp2_roi_pct,
+        "sl_price": sl_price,
+        "sl_price_pct": sl_price_pct,
+        "sl_roi_pct": sl_roi_pct,
+        "atr_pct": atr_pct,
+        "range_position": round(range_position, 3),
+        "notes": notes,
+        "summary": (
+            f"Entrada ref. {price_fmt(entry_price)} | "
+            f"TP1 +{pct_fmt(tp1_price_pct)} (~{pct_fmt(tp1_roi_pct)} em {LEVERAGE:g}x) | "
+            f"TP2 +{pct_fmt(tp2_price_pct)} (~{pct_fmt(tp2_roi_pct)} em {LEVERAGE:g}x) | "
+            f"SL -{pct_fmt(sl_price_pct)} (~-{pct_fmt(sl_roi_pct)} em {LEVERAGE:g}x)"
+        ),
+    }
+
+
 def scan_one_rsi(symbol: str, tf_label: str, tf_interval: str, now_slot: str) -> tuple[dict, list[dict]]:
     """Calcula o RSI de um par/timeframe."""
     df = get_candles(symbol, tf_interval)
@@ -210,10 +353,17 @@ def scan_one_rsi(symbol: str, tf_label: str, tf_interval: str, now_slot: str) ->
 
     value = float(rsi.iloc[-1])
     triggered_levels = [level for level in ALERT_LEVELS if value < level["limit"]]
+    plan = build_trade_plan(
+        df,
+        value,
+        tf_label,
+        "extreme" if any(level["key"] == "extreme" for level in triggered_levels) else "warning",
+    )
     item = {
         "symbol": symbol,
         "tf": tf_label,
         "rsi": round(value, 2),
+        "price": round(float(df["close"].iloc[-1]), 8),
         "alert": bool(triggered_levels),
         "alert_levels": [level["key"] for level in triggered_levels],
         "already_alerted_this_hour": [
@@ -221,6 +371,7 @@ def scan_one_rsi(symbol: str, tf_label: str, tf_interval: str, now_slot: str) ->
             for level in triggered_levels
             if f"{symbol}_{tf_label}_{level['key']}_{now_slot}" in _alerted
         ],
+        "trade_plan": plan if triggered_levels else None,
     }
 
     alerts = []
@@ -233,10 +384,12 @@ def scan_one_rsi(symbol: str, tf_label: str, tf_interval: str, now_slot: str) ->
                     "tf": tf_label,
                     "rsi": value,
                     "key": key,
-                    "level": level["key"],
-                    "limit": level["limit"],
-                }
-            )
+                            "level": level["key"],
+                            "limit": level["limit"],
+                            "price": float(df["close"].iloc[-1]),
+                            "trade_plan": plan,
+                        }
+                    )
 
     return item, alerts
 
@@ -283,6 +436,8 @@ def scan_rsi_values_locked(force: bool = False) -> tuple[list[dict], list[dict],
                 "rsi": round(alert["rsi"], 2),
                 "level": alert["level"],
                 "limit": alert["limit"],
+                "price": round(alert["price"], 8),
+                "trade_plan": alert["trade_plan"],
             }
             for alert in alerts
         ]
@@ -355,6 +510,13 @@ def send_email(subject: str, body_html: str) -> bool:
     return send_email_via_gmail(subject, body_html)
 
 
+def is_email_configured() -> bool:
+    if RESEND_API_KEY:
+        return bool(EMAIL_TO)
+
+    return bool(EMAIL_FROM and EMAIL_TO and GMAIL_PASS)
+
+
 def build_email_html(alerts: list[dict], alert_level: dict) -> str:
     """Monta um e-mail HTML com os alertas."""
     rows = ""
@@ -362,12 +524,24 @@ def build_email_html(alerts: list[dict], alert_level: dict) -> str:
         value = alert["rsi"]
         color = alert_level["color"]
         status = alert_level["status"].format(limit=alert_level["limit"])
+        plan = alert["trade_plan"]
+        plan_notes = "<br>".join(html.escape(note) for note in plan["notes"])
         rows += f"""
         <tr>
           <td style="padding:8px 12px;font-weight:bold">{html.escape(alert['symbol'])}</td>
           <td style="padding:8px 12px">{html.escape(alert['tf'])}</td>
+          <td style="padding:8px 12px">{price_fmt(alert['price'])}</td>
           <td style="padding:8px 12px;color:{color};font-weight:bold">{value:.2f}</td>
           <td style="padding:8px 12px">{status}</td>
+          <td style="padding:8px 12px;font-size:12px;line-height:1.45">
+            <strong>Score:</strong> {plan['score']}/95 ({html.escape(plan['confidence'])})<br>
+            <strong>Entrada:</strong> {price_fmt(plan['entry_price'])}
+            <span style="color:#777">(zona {price_fmt(plan['entry_zone_low'])} - {price_fmt(plan['entry_zone_high'])})</span><br>
+            <strong>TP1:</strong> {price_fmt(plan['tp1_price'])} (+{pct_fmt(plan['tp1_price_pct'])}; ~{pct_fmt(plan['tp1_roi_pct'])} em {plan['leverage']:g}x)<br>
+            <strong>TP2:</strong> {price_fmt(plan['tp2_price'])} (+{pct_fmt(plan['tp2_price_pct'])}; ~{pct_fmt(plan['tp2_roi_pct'])} em {plan['leverage']:g}x)<br>
+            <strong>SL:</strong> {price_fmt(plan['sl_price'])} (-{pct_fmt(plan['sl_price_pct'])}; ~-{pct_fmt(plan['sl_roi_pct'])} em {plan['leverage']:g}x)<br>
+            <span style="color:#777">{plan_notes}</span>
+          </td>
         </tr>"""
 
     return f"""
@@ -383,15 +557,18 @@ def build_email_html(alerts: list[dict], alert_level: dict) -> str:
               <tr style="background:#f0f0f0">
                 <th style="padding:8px 12px;text-align:left">Par</th>
                 <th style="padding:8px 12px;text-align:left">Timeframe</th>
+                <th style="padding:8px 12px;text-align:left">Preco</th>
                 <th style="padding:8px 12px;text-align:left">RSI</th>
                 <th style="padding:8px 12px;text-align:left">Status</th>
+                <th style="padding:8px 12px;text-align:left">Plano tecnico</th>
               </tr>
             </thead>
             <tbody>{rows}</tbody>
           </table>
         </div>
         <div style="padding:12px 24px;background:#fafafa;font-size:12px;color:#888">
-          Alerta automatico. RSI periodo {RSI_PERIOD}.
+          Alerta automatico. RSI periodo {RSI_PERIOD}. Plano tecnico educacional, nao e recomendacao financeira.
+          Em alavancagem, perdas tambem sao multiplicadas; use tamanho de posicao e margem com cautela.
         </div>
       </div>
     </body></html>"""
@@ -519,12 +696,13 @@ def rsi_status():
                 "check_interval_min": CHECK_INTERVAL_MIN,
                 "http_timeout_seconds": HTTP_TIMEOUT_SECONDS,
                 "scan_max_workers": SCAN_MAX_WORKERS,
+                "leverage": LEVERAGE,
                 "display_timezone": DISPLAY_TIMEZONE,
                 "binance_base_urls": BINANCE_BASE_URLS,
                 "symbols": SYMBOLS,
                 "timeframes": list(TIMEFRAMES.keys()),
             },
-            "email_configured": bool(EMAIL_FROM and EMAIL_TO and GMAIL_PASS),
+            "email_configured": is_email_configured(),
             "email_provider": "resend" if RESEND_API_KEY else "gmail_smtp",
             "resend_from": RESEND_FROM if RESEND_API_KEY else None,
             "last_email_results": _last_email_results,
