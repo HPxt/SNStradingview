@@ -55,7 +55,7 @@ Opcionais:
 | `BACKTEST_VALIDATION_RATIO` | `0.35` | Parte final dos sinais usada como validacao fora da amostra |
 | `BACKTEST_SIGNAL_COOLDOWN` | `0` | Cooldown entre sinais; `0` usa o horizonte do timeframe |
 | `TRAINING_INTERVAL_MIN` | `180` | Frequencia do treino/calibracao em background |
-| `TRAINING_CANDLE_LIMIT` | `1000` | Candles usados no treino historico por par/timeframe |
+| `TRAINING_CANDLE_LIMIT` | `3000` | Candles usados no treino historico por par/timeframe |
 | `PLAN_MIN_WIN_RATE` | `60` | Assertividade minima para mostrar entrada/TP/SL no e-mail |
 | `PLAN_MIN_PROFIT_FACTOR` | `1.25` | Profit factor minimo para mostrar plano no e-mail |
 | `PLAN_MIN_AVG_ROI` | `0` | ROI medio minimo simulado para mostrar plano no e-mail |
@@ -64,7 +64,7 @@ Opcionais:
 | `BINANCE_BASE_URLS` | `https://data-api.binance.vision,https://api1.binance.com,https://api.binance.com` | URLs da Binance para tentar em ordem |
 | `DISABLE_SCHEDULER` | vazio | Use `true` para desativar o agendador |
 
-Os planos de entrada/TP/SL enviados por e-mail sao educativos e baseados em indicadores tecnicos. Por padrao, o app so envia e-mail quando a call completa passa os filtros minimos de assertividade, ROI, payoff, score e confianca. Candidatos recusados podem ser vistos em `/rsi`, mas nao viram e-mail. Eles nao executam ordens e nao substituem gestao de risco.
+Os planos de entrada/TP/SL enviados por e-mail sao educativos e baseados em indicadores tecnicos. Por padrao, o app so envia e-mail quando a call completa passa os filtros minimos de assertividade, ROI, payoff, score e confianca. Candidatos recusados podem ser vistos em `/rsi`, mas nao viram e-mail. O relatorio `/model-report` mostra a quantidade de dados por timeframe, o que passou e o que foi recusado. Eles nao executam ordens e nao substituem gestao de risco.
 
 ## Configurar Gmail
 

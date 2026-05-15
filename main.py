@@ -51,7 +51,7 @@ BACKTEST_MAX_SIGNALS = int(os.getenv("BACKTEST_MAX_SIGNALS", "80"))
 BACKTEST_VALIDATION_RATIO = float(os.getenv("BACKTEST_VALIDATION_RATIO", "0.35"))
 BACKTEST_SIGNAL_COOLDOWN = int(os.getenv("BACKTEST_SIGNAL_COOLDOWN", "0"))
 TRAINING_INTERVAL_MIN = int(os.getenv("TRAINING_INTERVAL_MIN", "180"))
-TRAINING_CANDLE_LIMIT = int(os.getenv("TRAINING_CANDLE_LIMIT", "1000"))
+TRAINING_CANDLE_LIMIT = int(os.getenv("TRAINING_CANDLE_LIMIT", "3000"))
 PLAN_MIN_WIN_RATE = float(os.getenv("PLAN_MIN_WIN_RATE", "60"))
 PLAN_MIN_PROFIT_FACTOR = float(os.getenv("PLAN_MIN_PROFIT_FACTOR", "1.25"))
 PLAN_MIN_AVG_ROI = float(os.getenv("PLAN_MIN_AVG_ROI", "0"))
@@ -138,13 +138,20 @@ def format_display_time() -> str:
     return f"{display_now().strftime('%d/%m/%Y %H:%M')} {DISPLAY_TIMEZONE}"
 
 
-def get_candles(symbol: str, interval: str, limit: int = CANDLE_LIMIT) -> pd.DataFrame | None:
+def get_candles(
+    symbol: str,
+    interval: str,
+    limit: int = CANDLE_LIMIT,
+    end_time: int | None = None,
+) -> pd.DataFrame | None:
     """Busca candles publicos da Binance Spot."""
     errors = []
 
     for base_url in BINANCE_BASE_URLS:
         klines_url = f"{base_url}/api/v3/klines"
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        params = {"symbol": symbol, "interval": interval, "limit": min(limit, 1000)}
+        if end_time is not None:
+            params["endTime"] = end_time
         try:
             response = requests.get(klines_url, params=params, timeout=HTTP_TIMEOUT_SECONDS)
             response.raise_for_status()
@@ -167,12 +174,13 @@ def get_candles(symbol: str, interval: str, limit: int = CANDLE_LIMIT) -> pd.Dat
                 ],
             )
             df = df.assign(
+                time=pd.to_numeric(df["time"], errors="coerce"),
                 open=pd.to_numeric(df["open"], errors="coerce"),
                 high=pd.to_numeric(df["high"], errors="coerce"),
                 low=pd.to_numeric(df["low"], errors="coerce"),
                 close=pd.to_numeric(df["close"], errors="coerce"),
             )
-            df = df.dropna(subset=["open", "high", "low", "close"])
+            df = df.dropna(subset=["time", "open", "high", "low", "close"])
             if not df.empty:
                 _last_candle_errors.pop(f"{symbol}_{interval}", None)
                 return df
@@ -189,6 +197,35 @@ def get_candles(symbol: str, interval: str, limit: int = CANDLE_LIMIT) -> pd.Dat
     _last_candle_errors[f"{symbol}_{interval}"] = error_message
     print(f"[ERRO] Candles {symbol} {interval}: {error_message}")
     return None
+
+
+def get_historical_candles(symbol: str, interval: str, total_limit: int) -> pd.DataFrame | None:
+    """Busca mais candles historicos paginando para tras na Binance."""
+    chunks = []
+    end_time = None
+
+    while sum(len(chunk) for chunk in chunks) < total_limit:
+        remaining = total_limit - sum(len(chunk) for chunk in chunks)
+        df = get_candles(symbol, interval, limit=min(remaining, 1000), end_time=end_time)
+        if df is None or df.empty:
+            break
+
+        chunks.append(df)
+        earliest_time = int(df["time"].min())
+        next_end_time = earliest_time - 1
+        if end_time == next_end_time:
+            break
+        end_time = next_end_time
+
+        if len(df) < min(remaining, 1000):
+            break
+
+    if not chunks:
+        return None
+
+    combined = pd.concat(chunks, ignore_index=True)
+    combined = combined.drop_duplicates(subset=["time"]).sort_values("time").tail(total_limit)
+    return combined.reset_index(drop=True)
 
 
 def calc_rsi(series: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
@@ -551,7 +588,7 @@ def evaluate_backtest(df: pd.DataFrame, rsi_series: pd.Series, tf_label: str, le
 
 
 def train_one_strategy(symbol: str, tf_label: str, tf_interval: str) -> dict:
-    df = get_candles(symbol, tf_interval, limit=TRAINING_CANDLE_LIMIT)
+    df = get_historical_candles(symbol, tf_interval, total_limit=TRAINING_CANDLE_LIMIT)
     results = {}
     if df is None:
         for level in ALERT_LEVELS:
@@ -624,6 +661,67 @@ def train_strategy_model() -> bool:
             _strategy_model["running"] = False
         print(f"[ERRO] Treino: {exc}")
         return False
+
+
+def build_model_report() -> dict:
+    stats = _strategy_model["stats"]
+    by_timeframe = {}
+    by_reason = {}
+
+    for item in stats.values():
+        tf = item.get("tf", "unknown")
+        level = item.get("level", "unknown")
+        reason = item.get("qualification_reason", "sem motivo")
+        by_timeframe.setdefault(
+            tf,
+            {
+                "total": 0,
+                "qualified": 0,
+                "levels": {},
+                "validation_samples": [],
+                "train_samples": [],
+            },
+        )
+        by_timeframe[tf]["total"] += 1
+        by_timeframe[tf]["qualified"] += 1 if item.get("qualified") else 0
+        by_timeframe[tf]["levels"].setdefault(level, {"total": 0, "qualified": 0})
+        by_timeframe[tf]["levels"][level]["total"] += 1
+        by_timeframe[tf]["levels"][level]["qualified"] += 1 if item.get("qualified") else 0
+        by_timeframe[tf]["validation_samples"].append(item.get("sample_size", 0))
+        by_timeframe[tf]["train_samples"].append(item.get("train_stats", {}).get("sample_size", 0))
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+
+    for tf, item in by_timeframe.items():
+        validation_samples = item.pop("validation_samples")
+        train_samples = item.pop("train_samples")
+        item["avg_validation_sample"] = (
+            round(sum(validation_samples) / len(validation_samples), 2) if validation_samples else 0
+        )
+        item["min_validation_sample"] = min(validation_samples) if validation_samples else 0
+        item["avg_train_sample"] = (
+            round(sum(train_samples) / len(train_samples), 2) if train_samples else 0
+        )
+        item["min_train_sample"] = min(train_samples) if train_samples else 0
+
+    qualified = [item for item in stats.values() if item.get("qualified")]
+    return {
+        "trained_at_utc": _strategy_model["trained_at_utc"],
+        "running": _strategy_model["running"],
+        "total": len(stats),
+        "qualified": len(qualified),
+        "rejected": len(stats) - len(qualified),
+        "by_timeframe": by_timeframe,
+        "rejection_reasons": by_reason,
+        "thresholds": {
+            "backtest_min_trades": BACKTEST_MIN_TRADES,
+            "backtest_validation_ratio": BACKTEST_VALIDATION_RATIO,
+            "backtest_signal_cooldown": BACKTEST_SIGNAL_COOLDOWN,
+            "plan_min_win_rate": PLAN_MIN_WIN_RATE,
+            "plan_min_profit_factor": PLAN_MIN_PROFIT_FACTOR,
+            "plan_min_avg_roi": PLAN_MIN_AVG_ROI,
+            "plan_min_score": PLAN_MIN_SCORE,
+        },
+    }
 
 
 def scan_one_rsi(symbol: str, tf_label: str, tf_interval: str, now_slot: str) -> tuple[dict, list[dict]]:
@@ -1023,6 +1121,12 @@ def force_train():
     return "Treinamento ja esta em andamento. Confira /rsi em instantes.", 202
 
 
+@app.route("/model-report")
+def model_report():
+    """Relatorio do treino por timeframe, nivel e motivo de aprovacao/reprovacao."""
+    return jsonify(build_model_report())
+
+
 @app.route("/rsi")
 def rsi_status():
     """Mostra os RSI que o app calculou por ultimo, sem travar em consultas externas."""
@@ -1067,6 +1171,7 @@ def rsi_status():
                     [item for item in _strategy_model["stats"].values() if item.get("qualified")]
                 ),
                 "total_count": len(_strategy_model["stats"]),
+                "report_url": "/model-report",
                 "stats": _strategy_model["stats"],
             },
             "pending_alerts": _last_scan["pending_alerts"],
