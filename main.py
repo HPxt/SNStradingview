@@ -2,6 +2,7 @@ import html
 import os
 import smtplib
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -48,7 +49,8 @@ BINANCE_BASE_URLS = [
     ).split(",")
     if url.strip()
 ]
-HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "4"))
+HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "2.5"))
+SCAN_MAX_WORKERS = int(os.getenv("SCAN_MAX_WORKERS", "8"))
 CANDLE_LIMIT = max(RSI_PERIOD + 50, 100)
 
 # Controle para nao enviar e-mail duplicado na mesma janela.
@@ -164,81 +166,97 @@ def calc_rsi(series: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
     return rsi
 
 
+def scan_one_rsi(symbol: str, tf_label: str, tf_interval: str, now_slot: str) -> tuple[dict, list[dict]]:
+    """Calcula o RSI de um par/timeframe."""
+    df = get_candles(symbol, tf_interval)
+    if df is None:
+        return (
+            {
+                "symbol": symbol,
+                "tf": tf_label,
+                "rsi": None,
+                "alert": False,
+                "error": "candles_unavailable",
+                "details": _last_candle_errors.get(f"{symbol}_{tf_interval}"),
+            },
+            [],
+        )
+
+    rsi = calc_rsi(df["close"]).dropna()
+    if rsi.empty:
+        return (
+            {
+                "symbol": symbol,
+                "tf": tf_label,
+                "rsi": None,
+                "alert": False,
+                "error": "insufficient_data",
+            },
+            [],
+        )
+
+    value = float(rsi.iloc[-1])
+    triggered_levels = [level for level in ALERT_LEVELS if value < level["limit"]]
+    item = {
+        "symbol": symbol,
+        "tf": tf_label,
+        "rsi": round(value, 2),
+        "alert": bool(triggered_levels),
+        "alert_levels": [level["key"] for level in triggered_levels],
+        "already_alerted_this_hour": [
+            level["key"]
+            for level in triggered_levels
+            if f"{symbol}_{tf_label}_{level['key']}_{now_slot}" in _alerted
+        ],
+    }
+
+    alerts = []
+    for level in triggered_levels:
+        key = f"{symbol}_{tf_label}_{level['key']}_{now_slot}"
+        if key not in _alerted:
+            alerts.append(
+                {
+                    "symbol": symbol,
+                    "tf": tf_label,
+                    "rsi": value,
+                    "key": key,
+                    "level": level["key"],
+                    "limit": level["limit"],
+                }
+            )
+
+    return item, alerts
+
+
 def scan_rsi_values() -> tuple[list[dict], list[dict]]:
-    """Calcula todos os RSI e retorna valores atuais e alertas pendentes."""
+    """Calcula todos os RSI em paralelo e retorna valores atuais e alertas pendentes."""
     now_slot = utc_now().strftime("%Y-%m-%d %H")
     values = []
     alerts = []
+    jobs = [
+        (symbol, tf_label, tf_interval)
+        for symbol in SYMBOLS
+        for tf_label, tf_interval in TIMEFRAMES.items()
+    ]
 
-    for symbol in SYMBOLS:
-        for tf_label, tf_interval in TIMEFRAMES.items():
-            df = get_candles(symbol, tf_interval)
-            if df is None:
-                values.append(
-                    {
-                        "symbol": symbol,
-                        "tf": tf_label,
-                        "rsi": None,
-                        "alert": False,
-                        "error": "candles_unavailable",
-                        "details": _last_candle_errors.get(f"{symbol}_{tf_interval}"),
-                    }
-                )
-                continue
-
-            rsi = calc_rsi(df["close"]).dropna()
-            if rsi.empty:
-                values.append(
-                    {
-                        "symbol": symbol,
-                        "tf": tf_label,
-                        "rsi": None,
-                        "alert": False,
-                        "error": "insufficient_data",
-                    }
-                )
-                continue
-
-            value = float(rsi.iloc[-1])
-            triggered_levels = [
-                level
-                for level in ALERT_LEVELS
-                if value < level["limit"]
-            ]
-            item = {
-                "symbol": symbol,
-                "tf": tf_label,
-                "rsi": round(value, 2),
-                "alert": bool(triggered_levels),
-                "alert_levels": [level["key"] for level in triggered_levels],
-                "already_alerted_this_hour": [
-                    level["key"]
-                    for level in triggered_levels
-                    if f"{symbol}_{tf_label}_{level['key']}_{now_slot}" in _alerted
-                ],
-            }
+    with ThreadPoolExecutor(max_workers=SCAN_MAX_WORKERS) as executor:
+        futures = [
+            executor.submit(scan_one_rsi, symbol, tf_label, tf_interval, now_slot)
+            for symbol, tf_label, tf_interval in jobs
+        ]
+        for future in as_completed(futures):
+            item, item_alerts = future.result()
             values.append(item)
+            alerts.extend(item_alerts)
 
-            for level in triggered_levels:
-                key = f"{symbol}_{tf_label}_{level['key']}_{now_slot}"
-                if key not in _alerted:
-                    alerts.append(
-                        {
-                            "symbol": symbol,
-                            "tf": tf_label,
-                            "rsi": value,
-                            "key": key,
-                            "level": level["key"],
-                            "limit": level["limit"],
-                        }
-                    )
-
+    values.sort(key=lambda item: (SYMBOLS.index(item["symbol"]), list(TIMEFRAMES).index(item["tf"])))
     return values, alerts
 
 
 def scan_rsi_values_locked(force: bool = False) -> tuple[list[dict], list[dict], bool]:
     """Executa um scan por vez e guarda o ultimo resultado para diagnostico rapido."""
-    if not _scan_lock.acquire(blocking=False):
+    acquired = _scan_lock.acquire(timeout=1) if force else _scan_lock.acquire(blocking=False)
+    if not acquired:
         return _last_scan["values"], _last_scan["pending_alerts"], False
 
     try:
@@ -446,6 +464,7 @@ def rsi_status():
                 "rsi_extreme_limit": RSI_EXTREME_LIMIT,
                 "check_interval_min": CHECK_INTERVAL_MIN,
                 "http_timeout_seconds": HTTP_TIMEOUT_SECONDS,
+                "scan_max_workers": SCAN_MAX_WORKERS,
                 "binance_base_urls": BINANCE_BASE_URLS,
                 "symbols": SYMBOLS,
                 "timeframes": list(TIMEFRAMES.keys()),
